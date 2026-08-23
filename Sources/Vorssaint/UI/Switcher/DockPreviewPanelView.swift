@@ -13,6 +13,7 @@ struct DockPreviewPanelView: View {
             previews: service.previews,
             selectedWindowID: service.selectedWindowID,
             currentAppName: service.currentAppName,
+            currentAppIcon: service.currentAppIcon,
             isPinned: service.isPinned,
             onPreview: service.preview,
             onEndPreview: service.endPreview,
@@ -39,6 +40,7 @@ struct DockPreviewPinnedPanelView: View {
             previews: panel.previews,
             selectedWindowID: panel.selectedWindowID,
             currentAppName: panel.currentAppName,
+            currentAppIcon: panel.currentAppIcon,
             isPinned: true,
             onPreview: panel.preview,
             onEndPreview: panel.endPreview,
@@ -63,6 +65,7 @@ private struct DockPreviewPanelContent: View {
     let previews: [CGWindowID: CGImage]
     let selectedWindowID: CGWindowID?
     let currentAppName: String?
+    let currentAppIcon: NSImage?
     let isPinned: Bool
     let onPreview: (SwitcherItem) -> Void
     let onEndPreview: (SwitcherItem) -> Void
@@ -196,7 +199,7 @@ private struct DockPreviewPanelContent: View {
             }
 
             HStack(spacing: 7) {
-                if let icon = windows.first?.appIcon {
+                if let icon = currentAppIcon ?? windows.first?.appIcon {
                     Image(nsImage: icon)
                         .resizable()
                         .frame(width: 16, height: 16)

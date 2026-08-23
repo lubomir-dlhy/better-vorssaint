@@ -20,6 +20,7 @@ final class DockPreviewService: ObservableObject {
     @Published private(set) var previews: [CGWindowID: CGImage] = [:]
     @Published private(set) var selectedWindowID: CGWindowID?
     @Published private(set) var currentAppName: String?
+    @Published private(set) var currentAppIcon: NSImage?
     @Published private(set) var isPinned = false
     private var isDraggingWindow = false
     private var snapTarget: WindowEdgeSnapTarget?
@@ -649,7 +650,8 @@ final class DockPreviewService: ObservableObject {
         currentSessionPID = hit.app.processIdentifier
         isPinned = false
         hasEnteredPanel = false
-        currentAppName = hit.app.localizedName ?? hit.app.bundleIdentifier ?? ""
+        currentAppName = hit.displayName ?? hit.app.localizedName ?? hit.app.bundleIdentifier ?? ""
+        currentAppIcon = hit.icon
         windows = list
         previews = Dictionary(uniqueKeysWithValues: list.compactMap { item in
             item.previewWindowID.flatMap { id in
@@ -688,6 +690,7 @@ final class DockPreviewService: ObservableObject {
         previews = [:]
         selectedWindowID = nil
         currentAppName = nil
+        currentAppIcon = nil
         currentSessionPID = nil
         isPinned = false
         activePanelFrame = nil
@@ -911,6 +914,7 @@ final class DockPreviewService: ObservableObject {
             previews: previews,
             selectedWindowID: selectedWindowID,
             currentAppName: currentAppName,
+            currentAppIcon: currentAppIcon,
             onClose: { [weak self] id in
                 self?.closePinnedPanel(id)
             }
@@ -981,22 +985,36 @@ final class DockPreviewService: ObservableObject {
         for candidate in elementAndParents(from: element) {
             guard pid(of: candidate) == dockPID,
                   let frame = appKitFrame(of: candidate),
-                  let app = runningApplication(forDockElement: candidate)
+                  let resolution = runningApplication(forDockElement: candidate)
             else { continue }
-            return DockHit(app: app, iconFrame: frame, preferences: preferences)
+            return DockHit(app: resolution.app,
+                           iconFrame: frame,
+                           preferences: preferences,
+                           displayName: resolution.displayName,
+                           icon: resolution.icon)
         }
         return nil
     }
 
-    private func runningApplication(forDockElement element: AXUIElement) -> NSRunningApplication? {
+    private func runningApplication(forDockElement element: AXUIElement) -> DockApplicationResolution? {
         let running = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular && !$0.isTerminated
+            $0.activationPolicy == .regular
+                && !$0.isTerminated
+                && !ParallShortcutResolver.isLaunchedByShortcut($0)
         }
 
         if let url = urlAttribute(element) {
+            if let shortcutBundle = Bundle(url: url),
+               let target = ParallShortcutResolver.targetApplication(for: shortcutBundle) {
+                return DockApplicationResolution(
+                    app: target,
+                    displayName: url.deletingPathExtension().lastPathComponent,
+                    icon: NSWorkspace.shared.icon(forFile: url.path)
+                )
+            }
             let standardized = url.standardizedFileURL.path
             if let app = running.first(where: { $0.bundleURL?.standardizedFileURL.path == standardized }) {
-                return app
+                return DockApplicationResolution(app: app)
             }
         }
 
@@ -1009,7 +1027,7 @@ final class DockPreviewService: ObservableObject {
                 app.bundleURL?.lastPathComponent.replacingOccurrences(of: ".app", with: ""),
             ].compactMap { $0 }.map(normalizeLabel)
             return labels.contains { label in names.contains(normalizeLabel(label)) }
-        }
+        }.map { DockApplicationResolution(app: $0) }
     }
 
     private func labelCandidates(from element: AXUIElement) -> [String] {
@@ -1217,6 +1235,22 @@ private struct DockHit {
     let app: NSRunningApplication
     let iconFrame: CGRect
     let preferences: DockPreviewPreferences
+    let displayName: String?
+    let icon: NSImage?
+}
+
+private struct DockApplicationResolution {
+    let app: NSRunningApplication
+    var displayName: String?
+    var icon: NSImage?
+
+    init(app: NSRunningApplication,
+         displayName: String? = nil,
+         icon: NSImage? = nil) {
+        self.app = app
+        self.displayName = displayName
+        self.icon = icon
+    }
 }
 
 private enum Zone {
@@ -1261,6 +1295,7 @@ final class DockPreviewPinnedPanel: ObservableObject, Identifiable {
     @Published private(set) var previews: [CGWindowID: CGImage]
     @Published private(set) var selectedWindowID: CGWindowID?
     let currentAppName: String?
+    let currentAppIcon: NSImage?
 
     weak var panel: NSPanel?
 
@@ -1275,12 +1310,14 @@ final class DockPreviewPinnedPanel: ObservableObject, Identifiable {
          previews: [CGWindowID: CGImage],
          selectedWindowID: CGWindowID?,
          currentAppName: String?,
+         currentAppIcon: NSImage?,
          onClose: @escaping (UUID) -> Void) {
         self.appPID = appPID
         self.windows = windows
         self.previews = previews
         self.selectedWindowID = selectedWindowID
         self.currentAppName = currentAppName
+        self.currentAppIcon = currentAppIcon
         self.onClose = onClose
         startRefreshTimer()
     }

@@ -1,8 +1,82 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Vorssaint
 
+import AppKit
 import CoreGraphics
+import Darwin
 import Foundation
+
+enum ParallShortcutResolver {
+    private static let targetBundleIdentifierKey = "ParallAppBundleId"
+
+    static func targetApplication(for shortcutBundle: Bundle) -> NSRunningApplication? {
+        guard let rawBundleIdentifier = shortcutBundle.object(
+            forInfoDictionaryKey: targetBundleIdentifierKey
+        ) as? String,
+              let shortcutExecutablePath = shortcutBundle.executableURL?.standardizedFileURL.path
+        else { return nil }
+
+        let bundleIdentifier = rawBundleIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bundleIdentifier.isEmpty else { return nil }
+        let targets = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+        guard let targetPID = matchingTargetProcessIdentifier(
+            shortcutExecutablePath: shortcutExecutablePath,
+            targetProcessIdentifiers: targets.map(\.processIdentifier),
+            parentExecutablePath: parentExecutablePath
+        ) else { return nil }
+        return targets.first { $0.processIdentifier == targetPID }
+    }
+
+    static func isLaunchedByShortcut(_ app: NSRunningApplication) -> Bool {
+        guard let parentPath = parentExecutablePath(of: app.processIdentifier),
+              let parentBundle = containingAppBundle(forExecutablePath: parentPath)
+        else { return false }
+        return parentBundle.object(forInfoDictionaryKey: targetBundleIdentifierKey) != nil
+    }
+
+    static func matchingTargetProcessIdentifier(
+        shortcutExecutablePath: String,
+        targetProcessIdentifiers: [pid_t],
+        parentExecutablePath: (pid_t) -> String?
+    ) -> pid_t? {
+        let shortcutPath = URL(fileURLWithPath: shortcutExecutablePath).standardizedFileURL.path
+        return targetProcessIdentifiers.first { targetPID in
+            guard let parentPath = parentExecutablePath(targetPID) else { return false }
+            return URL(fileURLWithPath: parentPath).standardizedFileURL.path == shortcutPath
+        }
+    }
+
+    private static func parentExecutablePath(of pid: pid_t) -> String? {
+        guard let parentPID = parentProcessIdentifier(of: pid) else { return nil }
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let length = buffer.withUnsafeMutableBytes { bytes in
+            proc_pidpath(parentPID, bytes.baseAddress, UInt32(bytes.count))
+        }
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private static func parentProcessIdentifier(of pid: pid_t) -> pid_t? {
+        var info = proc_bsdinfo()
+        let expectedSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, expectedSize) == expectedSize else {
+            return nil
+        }
+        let parentPID = pid_t(info.pbi_ppid)
+        return parentPID > 0 ? parentPID : nil
+    }
+
+    private static func containingAppBundle(forExecutablePath path: String) -> Bundle? {
+        var candidate = URL(fileURLWithPath: path).deletingLastPathComponent()
+        while candidate.path != "/" {
+            if candidate.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
+                return Bundle(url: candidate)
+            }
+            candidate.deleteLastPathComponent()
+        }
+        return nil
+    }
+}
 
 enum DockPreviewOrientation: String, Equatable {
     case bottom

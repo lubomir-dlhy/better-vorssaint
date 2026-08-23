@@ -6730,6 +6730,23 @@ struct MetricsTests {
 
         // MARK: Dock Preview helpers
 
+        let parallParentPaths: [pid_t: String] = [
+            200: "/Applications/Other.app/Contents/MacOS/Other",
+            201: "/Applications/Claude Personal.app/Contents/MacOS/Claude Personal",
+        ]
+        expect(ParallShortcutResolver.matchingTargetProcessIdentifier(
+            shortcutExecutablePath: "/Applications/Claude Personal.app/Contents/../Contents/MacOS/Claude Personal",
+            targetProcessIdentifiers: [200, 201],
+            parentExecutablePath: { parallParentPaths[$0] }
+        ) == 201,
+               "a Parall shortcut resolves only the target process launched by its executable")
+        expect(ParallShortcutResolver.matchingTargetProcessIdentifier(
+            shortcutExecutablePath: "/Applications/Claude Personal.app/Contents/MacOS/Claude Personal",
+            targetProcessIdentifiers: [200],
+            parentExecutablePath: { parallParentPaths[$0] }
+        ) == nil,
+               "a Parall shortcut ignores same-bundle targets launched elsewhere")
+
         let dockPrefs = DockPreviewPreferences.sanitized(orientation: "left",
                                                          autohide: true,
                                                          tileSize: 81,
