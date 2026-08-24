@@ -218,43 +218,57 @@ struct FanControlCardContent: View {
     }
 
     private func sensorRows(_ sensors: [FanControlSensorReading]) -> some View {
-        DisclosureGroup(isExpanded: $sensorsExpanded) {
-            VStack(spacing: 5) {
-                ForEach(sensors) { sensor in
-                    HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(sensor.name)
-                                .font(.system(size: 10.5))
-                            Text(sensor.key)
-                                .font(.system(size: 8.5).monospaced())
-                                .foregroundStyle(.tertiary)
-                        }
-                        Spacer()
-                        Text(MetricFormat.temperature(sensor.celsius, unit: temperatureUnit))
-                            .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+        VStack(spacing: 0) {
+            Button {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { sensorsExpanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: sensorsExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 9)
+                    Image(systemName: "thermometer.medium")
+                        .foregroundStyle(.secondary)
+                    Text(strings.temperature)
+                        .font(.system(size: 10.5, weight: .semibold))
+                    Spacer()
+                    if let ambient = sensors.first(where: { $0.key == "TAOL" }) {
+                        Text(MetricFormat.temperature(ambient.celsius, unit: temperatureUnit))
+                            .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("\(sensors.count)")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
                 }
+                .contentShape(Rectangle())
             }
-            .padding(.top, 5)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "thermometer.medium")
-                    .foregroundStyle(.secondary)
-                Text(strings.temperature)
-                    .font(.system(size: 10.5, weight: .semibold))
-                Spacer()
-                if let ambient = sensors.first(where: { $0.key == "TAOL" }) {
-                    Text(MetricFormat.temperature(ambient.celsius, unit: temperatureUnit))
-                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("\(sensors.count)")
-                        .font(.system(size: 10).monospacedDigit())
-                        .foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+            .accessibilityValue(sensorsExpanded ? "Expanded" : "Collapsed")
+
+            if sensorsExpanded {
+                VStack(spacing: 5) {
+                    ForEach(sensors) { sensor in
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(sensor.name)
+                                    .font(.system(size: 10.5))
+                                Text(sensor.key)
+                                    .font(.system(size: 8.5).monospaced())
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Spacer()
+                            Text(MetricFormat.temperature(sensor.celsius, unit: temperatureUnit))
+                                .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                        }
+                    }
                 }
+                .padding(.top, 5)
             }
         }
-        .tint(.secondary)
     }
 
     @ViewBuilder
