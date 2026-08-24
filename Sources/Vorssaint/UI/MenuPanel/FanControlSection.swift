@@ -67,6 +67,8 @@ struct FanControlSection: View {
 }
 
 struct FanControlCardContent: View {
+    @State private var sensorsExpanded = true
+
     let strings: FanControlFeatureStrings
     let betaLabel: String
     let snapshot: FanControlSnapshot
@@ -86,6 +88,10 @@ struct FanControlCardContent: View {
             statusHeader
 
             if !snapshot.fans.isEmpty { fanRows }
+
+            if let sensors = snapshot.sensors, !sensors.isEmpty {
+                sensorRows(sensors)
+            }
 
             if let message = stateMessage {
                 Text(message)
@@ -209,6 +215,46 @@ struct FanControlCardContent: View {
             }
         }
         .padding(.vertical, 1)
+    }
+
+    private func sensorRows(_ sensors: [FanControlSensorReading]) -> some View {
+        DisclosureGroup(isExpanded: $sensorsExpanded) {
+            VStack(spacing: 5) {
+                ForEach(sensors) { sensor in
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(sensor.name)
+                                .font(.system(size: 10.5))
+                            Text(sensor.key)
+                                .font(.system(size: 8.5).monospaced())
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                        Text(MetricFormat.temperature(sensor.celsius, unit: temperatureUnit))
+                            .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                    }
+                }
+            }
+            .padding(.top, 5)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "thermometer.medium")
+                    .foregroundStyle(.secondary)
+                Text(strings.temperature)
+                    .font(.system(size: 10.5, weight: .semibold))
+                Spacer()
+                if let ambient = sensors.first(where: { $0.key == "TAOL" }) {
+                    Text(MetricFormat.temperature(ambient.celsius, unit: temperatureUnit))
+                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(sensors.count)")
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .tint(.secondary)
     }
 
     @ViewBuilder

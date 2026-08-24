@@ -35,6 +35,14 @@ struct FanControlTemperatureReading: Codable, Equatable, Sendable {
     let celsius: Double
 }
 
+struct FanControlSensorReading: Codable, Equatable, Identifiable, Sendable {
+    let key: String
+    let name: String
+    let celsius: Double
+
+    var id: String { key }
+}
+
 struct FanControlCurvePoint: Codable, Equatable, Sendable {
     var temperature: Int
     var coolingLevel: Int
@@ -96,6 +104,7 @@ struct FanControlSnapshot: Codable, Equatable, Sendable {
     var coolingLevel: Int?
     var configuration: FanControlConfiguration?
     var temperatures: [FanControlTemperatureReading]?
+    var sensors: [FanControlSensorReading]? = nil
 
     static let empty = FanControlSnapshot(fans: [], isCooling: false,
                                           endsAt: nil, stopReason: nil,
@@ -278,6 +287,45 @@ enum FanControlPolicy {
 
     static func validTemperature(_ value: Double) -> Bool {
         value.isFinite && value >= 1 && value < 125
+    }
+
+    private static let hardwareSensorMetadata: [(key: String, name: String)] = [
+        ("TAOL", "Ambient outside lid"),
+        ("TA0P", "Ambient airflow"),
+        ("TaLP", "Left airflow"),
+        ("TaRF", "Right airflow"),
+        ("TaLW", "Left airflow proximity"),
+        ("TaRW", "Right airflow proximity"),
+        ("TaTP", "Top proximity"),
+        ("TB0T", "Battery 1"),
+        ("TB1T", "Battery 2"),
+        ("TB2T", "Battery 3"),
+        ("TB3T", "Battery 4"),
+        ("TCMb", "CPU die average"),
+        ("TC0D", "CPU die"),
+        ("TCHP", "CPU proximity"),
+        ("TC0P", "CPU proximity"),
+        ("TG0D", "GPU die"),
+        ("TG0P", "GPU proximity"),
+        ("Ts0P", "Storage proximity 1"),
+        ("Ts1P", "Storage proximity 2"),
+        ("TW0P", "Wireless proximity"),
+    ]
+
+    static let hardwareSensorKeys = Set(hardwareSensorMetadata.map(\.key))
+
+    static func hardwareSensorReadings(
+        _ readings: [(key: String, value: Double)]
+    ) -> [FanControlSensorReading] {
+        let values = Dictionary(readings.map { ($0.key, $0.value) },
+                                uniquingKeysWith: { _, newest in newest })
+        return hardwareSensorMetadata.compactMap { sensor in
+            guard let value = values[sensor.key], value.isFinite,
+                  value >= -20, value < 125 else { return nil }
+            return FanControlSensorReading(key: sensor.key,
+                                           name: sensor.name,
+                                           celsius: value)
+        }
     }
 
     static func aggregatedTemperatures(

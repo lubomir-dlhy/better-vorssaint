@@ -40,6 +40,7 @@ final class FanControlHardware {
     private struct TemperatureKeys {
         let cpu: [SMCClient.Key]
         let gpu: [SMCClient.Key]
+        let hardware: [SMCClient.Key]
     }
 
     private let client: SMCClient
@@ -62,7 +63,8 @@ final class FanControlHardware {
                                           endsAt: nil, stopReason: nil,
                                           coolingLevel: nil,
                                           configuration: nil,
-                                          temperatures: readTemperatures())
+                                          temperatures: readTemperatures(),
+                                          sensors: readHardwareTemperatures())
         if let forceTest = forceTestKey(), try byteValue(forceTest) != 0 {
             throw FanControlHardwareError.alreadyControlled
         }
@@ -89,7 +91,8 @@ final class FanControlHardware {
                                   endsAt: nil, stopReason: nil,
                                   coolingLevel: nil,
                                   configuration: nil,
-                                  temperatures: nil)
+                                  temperatures: readTemperatures(),
+                                  sensors: readHardwareTemperatures())
     }
 
     func startCooling(level: Int) throws -> [FanControlFanReading] {
@@ -230,7 +233,8 @@ final class FanControlHardware {
                                   stopReason: stopReason,
                                   coolingLevel: coolingLevel,
                                   configuration: configuration,
-                                  temperatures: readTemperatures())
+                                  temperatures: readTemperatures(),
+                                  sensors: readHardwareTemperatures())
     }
 
     func coolingIsIntact() -> Bool {
@@ -246,6 +250,15 @@ final class FanControlHardware {
             gpuReadings: temperatureReadings(keys.gpu).map(\.value),
             platform: temperaturePlatform
         )
+    }
+
+    func readHardwareTemperatures() -> [FanControlSensorReading] {
+        let keys = discoverTemperatureKeys().hardware
+        let readings = keys.compactMap { key -> (key: String, value: Double)? in
+            guard let value = client.readValue(key) else { return nil }
+            return (key.name, value)
+        }
+        return FanControlPolicy.hardwareSensorReadings(readings)
     }
 
     // MARK: - Discovery
@@ -321,13 +334,15 @@ final class FanControlHardware {
         let keys = client.keys { name in
             TemperatureSensorSelector.isCPUTemperatureKey(name, platform: temperaturePlatform)
                 || name.hasPrefix("Tg")
+                || FanControlPolicy.hardwareSensorKeys.contains(name)
         }
         let result = TemperatureKeys(
             cpu: keys.filter {
                 TemperatureSensorSelector.isCPUTemperatureKey($0.name,
                                                               platform: temperaturePlatform)
             },
-            gpu: keys.filter { $0.name.hasPrefix("Tg") }
+            gpu: keys.filter { $0.name.hasPrefix("Tg") },
+            hardware: keys.filter { FanControlPolicy.hardwareSensorKeys.contains($0.name) }
         )
         temperatureKeys = result
         return result

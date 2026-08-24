@@ -9777,6 +9777,20 @@ struct MetricsTests {
                 && FanControlPolicy.menuBarWidthUnits(fanCount: 0) == 0,
                "fan RPM menu bar width reserves one or several five-digit readings")
 
+        let hardwareSensors = FanControlPolicy.hardwareSensorReadings([
+            ("TaRF", 49.8),
+            ("TAOL", 32.6),
+            ("Ts0P", 34.5),
+            ("unknown", 99),
+            ("TB0T", .nan),
+        ])
+        expect(hardwareSensors.map(\.key) == ["TAOL", "TaRF", "Ts0P"]
+                && hardwareSensors.map(\.name) == [
+                    "Ambient outside lid", "Right airflow", "Storage proximity 1",
+                ]
+                && hardwareSensors.map(\.celsius) == [32.6, 49.8, 34.5],
+               "fan hardware temperature sensor filtering and labels")
+
         let floatRPM = SMCValueCodec.encode(4_850, type: "flt ", size: 4)
         expect(floatRPM.flatMap { SMCValueCodec.decode($0, type: "flt ") } == 4_850,
                "native fan RPM floats round-trip exactly")
