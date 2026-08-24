@@ -392,7 +392,10 @@ final class FanControlService: ObservableObject {
     private func replaceRegistrationIfNeeded() -> Bool {
         let installed = UserDefaults.standard.string(forKey: DefaultsKey.fanControlHelperVersion) ?? ""
         let current = Self.helperVersion
-        guard !installed.isEmpty, installed != current,
+        // An enabled helper without a saved version predates helper versioning
+        // (or was carried over while copying settings). Treat it as stale so
+        // the bundled daemon is installed before the first control request.
+        guard installed != current,
               registrationAttemptedVersion != current,
               !UserDefaults.standard.bool(forKey: DefaultsKey.fanControlRecoveryNeeded) else { return false }
         registrationAttemptedVersion = current
