@@ -30,8 +30,7 @@ struct PanelHomebrewView: View {
                     searchControls
                     packageList(homebrew.searchResults,
                                 emptyText: searchEmptyText,
-                                isLoading: homebrew.isSearching
-                                    || (!homebrew.searchResults.isEmpty && homebrew.isLoadingPopularity))
+                                isLoading: homebrew.isSearching)
                 } else {
                     installedControls
                     packageList(filteredInstalled,

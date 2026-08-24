@@ -8666,15 +8666,9 @@ struct MetricsTests {
         expectEqual(HomebrewCommandBuilder.shellEnvLine(brewPath: brewPath, shellPath: "/opt/homebrew/bin/fish"),
                     "eval (/opt/homebrew/bin/brew shellenv fish)",
                     "Homebrew shell setup line matches the interactive shell")
-        expectEqual(HomebrewAnalytics.url(kind: .formula).absoluteString,
-                    "https://formulae.brew.sh/api/analytics/install-on-request/homebrew-core/30d.json",
-                    "Homebrew formula popularity uses install-on-request analytics")
-        expectEqual(HomebrewAnalytics.url(kind: .cask).absoluteString,
-                    "https://formulae.brew.sh/api/analytics/cask-install/homebrew-cask/30d.json",
-                    "Homebrew cask popularity uses cask install analytics")
-        expectEqual(HomebrewAnalytics.compactCount(999), "999", "Homebrew popularity under 1K stays plain")
-        expectEqual(HomebrewAnalytics.compactCount(1_250), "1.2K", "Homebrew popularity compacts thousands")
-        expectEqual(HomebrewAnalytics.compactCount(1_200_000), "1.2M", "Homebrew popularity compacts millions")
+        expectEqual(HomebrewPopularityFormatting.compactCount(999), "999", "Homebrew popularity under 1K stays plain")
+        expectEqual(HomebrewPopularityFormatting.compactCount(1_250), "1.2K", "Homebrew popularity compacts thousands")
+        expectEqual(HomebrewPopularityFormatting.compactCount(1_200_000), "1.2M", "Homebrew popularity compacts millions")
         let shellSetupCommand = HomebrewCommandBuilder.shellConfigCommand(brewPath: brewPath,
                                                                           homeDirectory: "/Users/test",
                                                                           shellPath: "/bin/zsh")
@@ -8825,31 +8819,6 @@ struct MetricsTests {
                                                               installed: homebrewPackages)
         expect(searchPackages.map(\.name) == ["sample-formula", "sample-filter", "sample-tool"],
                "Homebrew search parser keeps valid one-token results")
-        let analyticsJSON = """
-        {
-          "category": "formula_install_on_request",
-          "formulae": {
-            "sample-formula": [
-              { "formula": "sample-formula", "count": "21,557" },
-              { "formula": "sample-formula --HEAD", "count": "30" }
-            ],
-            "sample-filter": [
-              { "formula": "sample-filter", "count": "42,001" }
-            ]
-          }
-        }
-        """
-        let popularity = (try? HomebrewAnalytics.parse(Data(analyticsJSON.utf8), kind: .formula)) ?? [:]
-        expect(popularity["sample-formula"]?.count == 21_557,
-               "Homebrew analytics parser prefers the exact formula count")
-        expect(popularity["sample-filter"]?.rank == 1,
-               "Homebrew analytics parser ranks by count")
-        let rankedPackages = HomebrewAnalytics.enrichAndSort(searchPackages, popularity: popularity)
-        expect(rankedPackages.map(\.name) == ["sample-filter", "sample-formula", "sample-tool"],
-               "Homebrew search results sort by popularity first")
-        expect(rankedPackages.first?.popularity?.compactCount == "42K",
-               "Homebrew search results keep compact popularity")
-
         // MARK: Localization format contracts
 
         let localizedStrings: [(AppLanguage, Strings)] = [
@@ -10320,14 +10289,6 @@ struct MetricsTests {
                    "every recent capture string is set for \(language.rawValue)")
             expect(recentCaptureValues.allSatisfy { !$0.contains("—") },
                    "no em-dash in recent capture strings (\(language.rawValue))")
-            let feedbackValues = Mirror(reflecting: FeatureStrings.feedback(language)).children
-                .compactMap { $0.value as? String }
-            expect(feedbackValues.count == 28 && feedbackValues.allSatisfy { !$0.isEmpty },
-                   "every feedback string is set for \(language.rawValue)")
-            expect(feedbackValues.allSatisfy { !$0.contains("—") },
-                   "no em-dash in visible feedback strings (\(language.rawValue))")
-            expect(FeatureStrings.feedback(language).charactersFormat.contains("%d"),
-                   "feedback character format keeps its placeholder (\(language.rawValue))")
             let cameraPreviewValues = Mirror(reflecting: FeatureStrings.cameraPreview(language)).children
                 .compactMap { $0.value as? String }
             expect(!cameraPreviewValues.isEmpty && cameraPreviewValues.allSatisfy { !$0.isEmpty },

@@ -111,11 +111,11 @@ struct HomebrewPopularity: Hashable {
     let days: Int
 
     var compactCount: String {
-        HomebrewAnalytics.compactCount(count)
+        HomebrewPopularityFormatting.compactCount(count)
     }
 
     var decimalCount: String {
-        HomebrewAnalytics.decimalCount(count)
+        HomebrewPopularityFormatting.decimalCount(count)
     }
 }
 
@@ -387,52 +387,7 @@ enum HomebrewCommandBuilder {
     }
 }
 
-enum HomebrewAnalytics {
-    static let defaultDays = 30
-
-    static func url(kind: HomebrewPackageKind, days: Int = defaultDays) -> URL {
-        let category = kind == .formula ? "install-on-request/homebrew-core" : "cask-install/homebrew-cask"
-        return URL(string: "https://formulae.brew.sh/api/analytics/\(category)/\(days)d.json")!
-    }
-
-    static func parse(_ data: Data,
-                      kind: HomebrewPackageKind,
-                      days: Int = defaultDays) throws -> [String: HomebrewPopularity] {
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return [:]
-        }
-        let counts = counts(from: root, kind: kind)
-        let rankedTokens = counts.sorted { lhs, rhs in
-            if lhs.value != rhs.value { return lhs.value > rhs.value }
-            return lhs.key.localizedCaseInsensitiveCompare(rhs.key) == .orderedAscending
-        }
-        return Dictionary(uniqueKeysWithValues: rankedTokens.enumerated().map { index, element in
-            (element.key, HomebrewPopularity(count: element.value, rank: index + 1, days: days))
-        })
-    }
-
-    static func enrichAndSort(_ packages: [HomebrewPackage],
-                              popularity: [String: HomebrewPopularity]) -> [HomebrewPackage] {
-        packages
-            .map { package in
-                var copy = package
-                copy.popularity = popularity[package.name]
-                return copy
-            }
-            .sorted { lhs, rhs in
-                switch (lhs.popularity?.count, rhs.popularity?.count) {
-                case let (left?, right?) where left != right:
-                    return left > right
-                case (_?, nil):
-                    return true
-                case (nil, _?):
-                    return false
-                default:
-                    return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
-                }
-            }
-    }
-
+enum HomebrewPopularityFormatting {
     static func compactCount(_ count: Int) -> String {
         if count >= 1_000_000 {
             let value = Double(count) / 1_000_000
@@ -447,51 +402,6 @@ enum HomebrewAnalytics {
 
     static func decimalCount(_ count: Int) -> String {
         NumberFormatter.localizedString(from: NSNumber(value: max(count, 0)), number: .decimal)
-    }
-
-    private static func counts(from root: [String: Any],
-                               kind: HomebrewPackageKind) -> [String: Int] {
-        if let grouped = root["formulae"] as? [String: [[String: Any]]] {
-            let nameKey = kind == .formula ? "formula" : "cask"
-            return grouped.reduce(into: [String: Int]()) { result, entry in
-                guard HomebrewCommandBuilder.isValidToken(entry.key) else { return }
-                let count = countForGroupedRecords(entry.value, token: entry.key, nameKey: nameKey)
-                if count > 0 {
-                    result[entry.key] = count
-                }
-            }
-        }
-
-        if let items = root["items"] as? [[String: Any]] {
-            let nameKey = kind == .formula ? "formula" : "cask"
-            return items.reduce(into: [String: Int]()) { result, item in
-                guard let token = item[nameKey] as? String,
-                      HomebrewCommandBuilder.isValidToken(token),
-                      let count = intCount(item["count"]) else { return }
-                result[token, default: 0] += count
-            }
-        }
-
-        return [:]
-    }
-
-    private static func countForGroupedRecords(_ records: [[String: Any]],
-                                               token: String,
-                                               nameKey: String) -> Int {
-        if let exact = records.first(where: { ($0[nameKey] as? String) == token }),
-           let count = intCount(exact["count"]) {
-            return count
-        }
-        return records.reduce(0) { total, record in
-            total + (intCount(record["count"]) ?? 0)
-        }
-    }
-
-    private static func intCount(_ value: Any?) -> Int? {
-        if let int = value as? Int { return int }
-        guard let string = value as? String else { return nil }
-        let digits = string.filter(\.isNumber)
-        return digits.isEmpty ? nil : Int(digits)
     }
 }
 

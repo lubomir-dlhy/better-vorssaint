@@ -15,7 +15,6 @@ final class HomebrewManager: ObservableObject {
     @Published private(set) var isLoadingInstalled = false
     @Published private(set) var isLoadingOutdated = false
     @Published private(set) var isSearching = false
-    @Published private(set) var isLoadingPopularity = false
     @Published private(set) var isLoadingDetails = false
     @Published private(set) var operation: HomebrewOperation?
     @Published private(set) var operationStatus: HomebrewOperationStatus?
@@ -37,21 +36,12 @@ final class HomebrewManager: ObservableObject {
     private var searchGeneration = 0
     private var detailsGeneration = 0
     private var outdatedGeneration = 0
-    private var currentSearchKind: HomebrewPackageKind?
-    private var popularityCache: [HomebrewPackageKind: PopularityCacheEntry] = [:]
-    private var popularityLoads: Set<HomebrewPackageKind> = []
     private var activeProcess: Process?
     private var cancelRequested = false
     private var installedCaskRecords: [HomebrewCaskRecord] = []
     private var installedCaskRecordsFetchedAt: Date?
     private var ownershipLoads: [String: [(HomebrewPackage?) -> Void]] = [:]
     private var completedOperationCleanup: DispatchWorkItem?
-    private lazy var analyticsSession: URLSession = {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 6
-        configuration.timeoutIntervalForResource = 8
-        return URLSession(configuration: configuration)
-    }()
 
     var isBusy: Bool {
         isLoadingInstalled || isSearching || isLoadingDetails || operation != nil
@@ -136,7 +126,6 @@ final class HomebrewManager: ObservableObject {
         self.brewPath = brewPath
         searchGeneration += 1
         let generation = searchGeneration
-        currentSearchKind = kind
         isSearching = true
         errorMessage = nil
         let command = HomebrewCommandBuilder.search(brewPath: brewPath, kind: kind, query: trimmed)
@@ -149,9 +138,6 @@ final class HomebrewManager: ObservableObject {
                                                                     kind: kind,
                                                                     installed: self.installed)
                     self.searchResults = self.packagesEnriched(packages, kind: kind)
-                    if !packages.isEmpty {
-                        self.loadPopularityIfNeeded(kind: kind)
-                    }
                 } else if output.localizedCaseInsensitiveContains("No formulae or casks found") {
                     self.searchResults = []
                 } else {
@@ -494,53 +480,6 @@ final class HomebrewManager: ObservableObject {
                                           finishedAt: status.finishedAt)
     }
 
-    private func loadPopularityIfNeeded(kind: HomebrewPackageKind) {
-        if popularityCache[kind]?.isFresh == true {
-            applyPopularityToCurrentSearch(kind: kind)
-            return
-        }
-        guard !popularityLoads.contains(kind) else { return }
-        popularityLoads.insert(kind)
-        isLoadingPopularity = true
-        let url = HomebrewAnalytics.url(kind: kind)
-        analyticsSession.dataTask(with: url) { [weak self] data, _, _ in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.popularityLoads.remove(kind)
-                self.isLoadingPopularity = !self.popularityLoads.isEmpty
-                guard let data,
-                      let values = try? HomebrewAnalytics.parse(data, kind: kind) else { return }
-                self.popularityCache[kind] = PopularityCacheEntry(values: values, fetchedAt: Date())
-                self.applyPopularityToCurrentSearch(kind: kind)
-            }
-        }.resume()
-    }
-
-    private func applyPopularityToCurrentSearch(kind: HomebrewPackageKind) {
-        guard currentSearchKind == kind else { return }
-        searchResults = packagesEnriched(searchResults, kind: kind)
-        if let selectedPackage, selectedPackage.kind == kind {
-            self.selectedPackage = packageEnriched(selectedPackage)
-        }
-    }
-
-    private func packagesApplyingPopularity(_ packages: [HomebrewPackage],
-                                            kind: HomebrewPackageKind) -> [HomebrewPackage] {
-        guard let cache = popularityCache[kind], cache.isFresh else {
-            return packages
-        }
-        return HomebrewAnalytics.enrichAndSort(packages, popularity: cache.values)
-    }
-
-    private func packageApplyingPopularity(_ package: HomebrewPackage) -> HomebrewPackage {
-        guard let popularity = popularityCache[package.kind]?.values[package.name] else {
-            return package
-        }
-        var copy = package
-        copy.popularity = popularity
-        return copy
-    }
-
     private func refreshOutdated(brewPath: String) {
         outdatedGeneration += 1
         let generation = outdatedGeneration
@@ -572,11 +511,11 @@ final class HomebrewManager: ObservableObject {
 
     private func packagesEnriched(_ packages: [HomebrewPackage],
                                   kind: HomebrewPackageKind) -> [HomebrewPackage] {
-        packagesApplyingPopularity(packages, kind: kind).map(packageApplyingOutdated)
+        packages.map(packageApplyingOutdated)
     }
 
     private func packageEnriched(_ package: HomebrewPackage) -> HomebrewPackage {
-        packageApplyingOutdated(packageApplyingPopularity(package))
+        packageApplyingOutdated(package)
     }
 
     private func packageApplyingOutdated(_ package: HomebrewPackage) -> HomebrewPackage {
@@ -790,14 +729,5 @@ final class HomebrewManager: ObservableObject {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         return "\"\(escaped)\""
-    }
-}
-
-private struct PopularityCacheEntry {
-    let values: [String: HomebrewPopularity]
-    let fetchedAt: Date
-
-    var isFresh: Bool {
-        Date().timeIntervalSince(fetchedAt) < 24 * 60 * 60
     }
 }
