@@ -64,6 +64,7 @@ struct MenuPanelView: View {
     @ObservedObject private var updates = UpdateService.shared
     @ObservedObject private var panelFocus = MenuPanelFocus.shared
     @ObservedObject private var features = FeatureRuntime.shared
+    @ObservedObject private var fanControl = FanControlService.shared
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(DefaultsKey.monitorShowMixer) private var showMixer = true
     @AppStorage(DefaultsKey.monitorShowSystem) private var showSystem = true
@@ -327,6 +328,9 @@ struct MenuPanelView: View {
                 } label: {
                     Image(systemName: id.symbolName)
                         .font(.system(size: 13.5, weight: .semibold))
+                        .symbolEffect(.variableColor.iterative, options: .repeating,
+                                      isActive: id == .fanControl
+                                          && fanControl.snapshot.isCooling)
                         .frame(maxWidth: .infinity)
                         .frame(height: 30)
                         .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
