@@ -2,6 +2,12 @@
 // Copyright (C) 2026 Vorssaint
 
 import Foundation
+import os
+
+private let fanControlHardwareLog = Logger(
+    subsystem: FanControlIdentifiers.helperID,
+    category: "FanControlHardware"
+)
 
 enum FanControlHardwareError: Error {
     case noFans
@@ -106,47 +112,46 @@ final class FanControlHardware {
             return target
         }
 
-        // Keep the target write adjacent to manual mode. The thermal controller
-        // can reclaim automatic mode between a separate verification and target.
-        var directSucceeded = true
-        for (fan, target) in zip(fans, targets) {
-            if !writeManualPair(for: fan, target: target) { directSucceeded = false }
+        // Engage and verify manual mode before writing a target. In particular,
+        // M5 firmware may accept F*md while rejecting an immediately adjacent
+        // F*Tg write (or returning an error even though the target was applied).
+        // A target failure must not turn a successful direct-mode transition
+        // into an Ftst requirement because Ftst is absent on known M5 hardware.
+        var manualModeReady = true
+        for fan in fans {
+            if !setMode(1, for: fan, attempts: 3) { manualModeReady = false }
         }
 
-        if directSucceeded {
-            Thread.sleep(forTimeInterval: 0.25)
-            directSucceeded = fans.allSatisfy { (try? modeValue($0.mode)) == 1 }
-        }
-
-        if !directSucceeded {
+        if !manualModeReady {
             guard let forceTest = forceTestKey(), setByte(1, for: forceTest, attempts: 20) else {
+                fanControlHardwareLog.error("Manual mode rejected and Ftst is unavailable")
                 throw FanControlHardwareError.operationFailed
             }
-            // A stopped Apple Silicon fan can reject manual mode until the
-            // automatic controller has accepted a protective maximum target.
-            // Apply the requested level only after manual mode sticks.
-            for fan in fans {
-                guard setValue(fan.maximumRPM, for: fan.target, attempts: 10) else {
-                    throw FanControlHardwareError.operationFailed
-                }
-            }
+            // M3/M4 thermal management can take several seconds to yield after
+            // Ftst is set. Match the established Apple-silicon implementations:
+            // wait, retry the mode transition, then write the target.
             Thread.sleep(forTimeInterval: 3)
             for fan in fans {
-                let deadline = ProcessInfo.processInfo.systemUptime + 10
+                let deadline = ProcessInfo.processInfo.systemUptime + 30
                 guard setMode(1, for: fan, untilUptime: deadline) else {
+                    fanControlHardwareLog.error(
+                        "Manual mode verification failed for fan \(fan.index, privacy: .public) after Ftst"
+                    )
                     throw FanControlHardwareError.operationFailed
                 }
             }
         }
 
-        if !directSucceeded {
-            for (fan, target) in zip(fans, targets) {
-                guard setValue(target, for: fan.target, attempts: 10) else {
-                    throw FanControlHardwareError.operationFailed
-                }
+        for (fan, target) in zip(fans, targets) {
+            guard setValue(target, for: fan.target, attempts: 10) else {
+                fanControlHardwareLog.error(
+                    "Target RPM verification failed for fan \(fan.index, privacy: .public)"
+                )
+                throw FanControlHardwareError.operationFailed
             }
         }
         guard verifyCooling(fans, targets: targets) else {
+            fanControlHardwareLog.error("Final fan-control verification failed")
             throw FanControlHardwareError.operationFailed
         }
         activeTargets = targets
@@ -386,16 +391,6 @@ final class FanControlHardware {
         return (try? modeValue(fan.mode)) == value
     }
 
-    private func writeManualPair(for fan: Fan, target: Double) -> Bool {
-        do {
-            try client.writeBytes([1], to: fan.mode)
-            try client.writeValue(target, to: fan.target)
-            return true
-        } catch {
-            return false
-        }
-    }
-
     private func setMode(_ value: UInt8, for fan: Fan, untilUptime deadline: TimeInterval) -> Bool {
         repeat {
             if setMode(value, for: fan, attempts: 1) { return true }
@@ -408,10 +403,10 @@ final class FanControlHardware {
 
     private func setByte(_ value: UInt8, for key: SMCClient.Key, attempts: Int) -> Bool {
         for attempt in 0..<attempts {
-            do {
-                try client.writeBytes([value], to: key)
-                if (try? byteValue(key)) == value { return true }
-            } catch {}
+            do { try client.writeBytes([value], to: key) } catch {}
+            // Some Apple-silicon SMC writes report an error even when firmware
+            // applied the value. Readback is authoritative.
+            if (try? byteValue(key)) == value { return true }
             if attempt + 1 < attempts { Thread.sleep(forTimeInterval: 0.05) }
         }
         return false
@@ -419,12 +414,18 @@ final class FanControlHardware {
 
     private func setValue(_ value: Double, for key: SMCClient.Key, attempts: Int) -> Bool {
         for attempt in 0..<attempts {
-            do {
-                try client.writeValue(value, to: key)
+            do { try client.writeValue(value, to: key) } catch {}
+            // F*Tg is known to occasionally return controller error 0x87 after
+            // successfully applying the target. Accept only a matching readback.
+            if let applied = client.readValue(key), targetMatches(applied, expected: value) {
                 return true
-            } catch {}
+            }
             if attempt + 1 < attempts { Thread.sleep(forTimeInterval: 0.05) }
         }
         return false
+    }
+
+    private func targetMatches(_ applied: Double, expected: Double) -> Bool {
+        applied.isFinite && abs(applied - expected) <= max(2, abs(expected) * 0.001)
     }
 }
