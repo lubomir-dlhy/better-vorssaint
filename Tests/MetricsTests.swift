@@ -9695,7 +9695,8 @@ struct MetricsTests {
                "manual targets map the full percentage scale into reported hardware bounds")
 
         let defaultCurve = FanControlConfiguration.defaultCurve
-        expect(FanControlPolicy.validConfiguration(.manual(level: 0))
+        expect(defaultCurve.sensor == .cpuProximity
+                && FanControlPolicy.validConfiguration(.manual(level: 0))
                 && FanControlPolicy.validConfiguration(.manual(level: 100))
                 && FanControlPolicy.validConfiguration(.curve([defaultCurve]))
                 && FanControlPolicy.interpolatedCoolingLevel(points: defaultCurve.points,
@@ -9708,14 +9709,14 @@ struct MetricsTests {
                                                              temperature: 80) == 100,
                "the default curve starts at 50 degrees, reaches maximum at 70 and rounds safely up")
         let coolingTemperature = [
-            FanControlTemperatureReading(source: .hottestSoC, celsius: 59),
+            FanControlTemperatureReading(source: .cpuProximity, celsius: 59),
         ]
         expect(FanControlPolicy.curveCoolingLevel(curves: [defaultCurve],
                                                   temperatures: coolingTemperature,
                                                   previousLevel: 50) == 50
                 && FanControlPolicy.curveCoolingLevel(
                     curves: [defaultCurve],
-                    temperatures: [.init(source: .hottestSoC, celsius: 57)],
+                    temperatures: [.init(source: .cpuProximity, celsius: 57)],
                     previousLevel: 50
                 ) == 45,
                "a cooling curve uses two-degree hysteresis before lowering fan speed")
@@ -9725,7 +9726,7 @@ struct MetricsTests {
                      FanControlCurvePoint(temperature: 80, coolingLevel: 80)]
         )
         let curveTemperatures = [
-            FanControlTemperatureReading(source: .hottestSoC, celsius: 54),
+            FanControlTemperatureReading(source: .cpuProximity, celsius: 54),
             FanControlTemperatureReading(source: .averageCPU, celsius: 70),
         ]
         expect(FanControlPolicy.curveCoolingLevel(curves: [defaultCurve, cpuCurve],
@@ -9734,7 +9735,7 @@ struct MetricsTests {
                                                       temperatures: [curveTemperatures[0]]) == nil,
                "several temperature rules use their highest demand and require every selected sensor")
         let duplicateCurves = [defaultCurve,
-                               FanControlCurve(sensor: .hottestSoC, points: cpuCurve.points)]
+                               FanControlCurve(sensor: .cpuProximity, points: cpuCurve.points)]
         let descendingCurve = FanControlCurve(
             sensor: .averageCPU,
             points: [FanControlCurvePoint(temperature: 50, coolingLevel: 80),
@@ -9757,6 +9758,13 @@ struct MetricsTests {
         expectClose(m3FanTemperatures.first { $0.source == .averageCPU }?.celsius ?? -1,
                     48.5,
                     "M3 fan curves exclude auxiliary Tf readings from the CPU average")
+        expect(FanControlPolicy.cpuProximityReading([
+                    ("TC0P", 48), ("TCHP", 53),
+                ]) == .init(source: .cpuProximity, celsius: 53)
+                && FanControlPolicy.cpuProximityReading([("TC0P", 48)])
+                    == .init(source: .cpuProximity, celsius: 48)
+                && FanControlPolicy.cpuProximityReading([("TCHP", .nan)]) == nil,
+               "fan curves prefer the primary CPU proximity sensor and use the legacy fallback")
         expect(FanControlPolicy.telemetryReadings(expectedCount: 1, readings: [1_200]) == [1_200]
                 && FanControlPolicy.telemetryReadings(expectedCount: 2,
                                                       readings: [1_200, 1_350]) == [1_200, 1_350],

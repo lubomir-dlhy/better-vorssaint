@@ -21,6 +21,7 @@ enum FanControlMode: String, Codable, Sendable {
 }
 
 enum FanControlTemperatureSource: String, Codable, CaseIterable, Identifiable, Sendable {
+    case cpuProximity
     case averageSoC
     case hottestSoC
     case averageCPU
@@ -59,7 +60,7 @@ struct FanControlConfiguration: Codable, Equatable, Sendable {
     var curves: [FanControlCurve]
 
     static let defaultCurve = FanControlCurve(
-        sensor: .hottestSoC,
+        sensor: .cpuProximity,
         points: [
             FanControlCurvePoint(temperature: 50, coolingLevel: 0),
             FanControlCurvePoint(temperature: 70, coolingLevel: 100),
@@ -326,6 +327,20 @@ enum FanControlPolicy {
                                            name: sensor.name,
                                            celsius: value)
         }
+    }
+
+    static func cpuProximityReading(
+        _ readings: [(key: String, value: Double)]
+    ) -> FanControlTemperatureReading? {
+        let values = Dictionary(readings.map { ($0.key, $0.value) },
+                                uniquingKeysWith: { _, newest in newest })
+        for key in ["TCHP", "TC0P"] {
+            if let value = values[key], validTemperature(value) {
+                return FanControlTemperatureReading(source: .cpuProximity,
+                                                    celsius: value)
+            }
+        }
+        return nil
     }
 
     static func aggregatedTemperatures(

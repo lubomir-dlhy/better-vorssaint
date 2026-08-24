@@ -245,20 +245,26 @@ final class FanControlHardware {
     func readTemperatures() -> [FanControlTemperatureReading] {
         let keys = discoverTemperatureKeys()
         let cpuReadings = temperatureReadings(keys.cpu)
-        return FanControlPolicy.aggregatedTemperatures(
+        var readings = FanControlPolicy.aggregatedTemperatures(
             cpuReadings: cpuReadings,
             gpuReadings: temperatureReadings(keys.gpu).map(\.value),
             platform: temperaturePlatform
         )
+        if let proximity = FanControlPolicy.cpuProximityReading(rawHardwareTemperatures()) {
+            readings.append(proximity)
+        }
+        return readings
     }
 
     func readHardwareTemperatures() -> [FanControlSensorReading] {
-        let keys = discoverTemperatureKeys().hardware
-        let readings = keys.compactMap { key -> (key: String, value: Double)? in
+        FanControlPolicy.hardwareSensorReadings(rawHardwareTemperatures())
+    }
+
+    private func rawHardwareTemperatures() -> [(key: String, value: Double)] {
+        discoverTemperatureKeys().hardware.compactMap { key in
             guard let value = client.readValue(key) else { return nil }
             return (key.name, value)
         }
-        return FanControlPolicy.hardwareSensorReadings(readings)
     }
 
     // MARK: - Discovery

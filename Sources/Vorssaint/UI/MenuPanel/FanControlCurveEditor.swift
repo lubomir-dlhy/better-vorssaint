@@ -40,7 +40,7 @@ struct FanControlCurveEditor: View {
             HStack(spacing: 6) {
                 Picker(strings.sensor, selection: curve.sensor) {
                     ForEach(sourceOptions(at: curveIndex)) { source in
-                        Text(sourceName(source)).tag(source)
+                        Label(sourceName(source), systemImage: sourceIcon(source)).tag(source)
                     }
                 }
                 .labelsHidden()
@@ -221,11 +221,20 @@ struct FanControlCurveEditor: View {
 
     private func sourceName(_ source: FanControlTemperatureSource) -> String {
         switch source {
+        case .cpuProximity: return "CPU Proximity"
         case .averageSoC: return strings.averageSoC
         case .hottestSoC: return strings.hottestSoC
         case .averageCPU: return strings.averageCPU
         case .hottestCPU: return strings.hottestCPU
         case .hottestGPU: return strings.hottestGPU
+        }
+    }
+
+    private func sourceIcon(_ source: FanControlTemperatureSource) -> String {
+        switch source {
+        case .cpuProximity, .averageCPU, .hottestCPU: return "cpu"
+        case .hottestGPU: return "rectangle.3.group"
+        case .averageSoC, .hottestSoC: return "cpu.fill"
         }
     }
 

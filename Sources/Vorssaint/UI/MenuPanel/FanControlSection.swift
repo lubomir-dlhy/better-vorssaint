@@ -253,6 +253,7 @@ struct FanControlCardContent: View {
                 VStack(spacing: 5) {
                     ForEach(sensors) { sensor in
                         HStack(spacing: 8) {
+                            sensorIcon(sensor)
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(sensor.name)
                                     .font(.system(size: 10.5))
@@ -269,6 +270,39 @@ struct FanControlCardContent: View {
                 .padding(.top, 5)
             }
         }
+    }
+
+    private func sensorIcon(_ sensor: FanControlSensorReading) -> some View {
+        let presentation = sensorIconPresentation(sensor)
+        return Image(systemName: presentation.name)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(presentation.color)
+            .frame(width: 15)
+            .accessibilityHidden(true)
+    }
+
+    private func sensorIconPresentation(
+        _ sensor: FanControlSensorReading
+    ) -> (name: String, color: Color) {
+        if sensor.key.hasPrefix("TB") {
+            return ("battery.75percent", .green)
+        }
+        if sensor.key.hasPrefix("TC") {
+            return ("cpu", .green)
+        }
+        if sensor.key.hasPrefix("TG") {
+            return ("rectangle.3.group", .purple)
+        }
+        if sensor.key.hasPrefix("Ts") {
+            return ("internaldrive", .secondary)
+        }
+        if sensor.key.hasPrefix("TW") {
+            return ("wifi", .blue)
+        }
+        if sensor.key.hasPrefix("TA") || sensor.key.hasPrefix("Ta") {
+            return ("wind", .cyan)
+        }
+        return ("thermometer.medium", .orange)
     }
 
     @ViewBuilder
