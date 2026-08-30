@@ -9720,6 +9720,24 @@ struct MetricsTests {
                     previousLevel: 50
                 ) == 45,
                "a cooling curve uses two-degree hysteresis before lowering fan speed")
+        expect(FanControlPolicy.curveCoolingLevel(
+                    curves: [defaultCurve],
+                    temperatures: [
+                        .init(source: .cpuProximity, celsius: 52),
+                        .init(source: .hottestSoC, celsius: 85),
+                    ]
+                ) == 50
+                && FanControlPolicy.curveCoolingLevel(
+                    curves: [defaultCurve],
+                    temperatures: [
+                        .init(source: .cpuProximity, celsius: 52),
+                        .init(source: .hottestGPU, celsius: 95),
+                    ]
+                ) == 100
+                && FanControlPolicy.safetyCoolingLevel(temperatures: [
+                    .init(source: .hottestCPU, celsius: 74.9),
+                ]) == nil,
+               "die temperature safety floor overrides an under-reporting proximity curve")
         let cpuCurve = FanControlCurve(
             sensor: .averageCPU,
             points: [FanControlCurvePoint(temperature: 40, coolingLevel: 0),
@@ -9759,12 +9777,12 @@ struct MetricsTests {
                     48.5,
                     "M3 fan curves exclude auxiliary Tf readings from the CPU average")
         expect(FanControlPolicy.cpuProximityReading([
-                    ("TC0P", 48), ("TCHP", 53),
+                    ("TC0P", 53), ("TCHP", 48),
                 ]) == .init(source: .cpuProximity, celsius: 53)
                 && FanControlPolicy.cpuProximityReading([("TC0P", 48)])
                     == .init(source: .cpuProximity, celsius: 48)
                 && FanControlPolicy.cpuProximityReading([("TCHP", .nan)]) == nil,
-               "fan curves prefer the primary CPU proximity sensor and use the legacy fallback")
+               "fan curves use the hottest valid CPU proximity sensor")
         expect(FanControlPolicy.telemetryReadings(expectedCount: 1, readings: [1_200]) == [1_200]
                 && FanControlPolicy.telemetryReadings(expectedCount: 2,
                                                       readings: [1_200, 1_350]) == [1_200, 1_350],

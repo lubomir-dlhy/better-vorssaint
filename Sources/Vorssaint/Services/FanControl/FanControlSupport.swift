@@ -166,6 +166,11 @@ enum FanControlPolicy {
     static let maximumCurvePointCount = 8
     static let maximumCurveCount = FanControlTemperatureSource.allCases.count
     static let curveHysteresis = 2.0
+    static let safetyCurvePoints = [
+        FanControlCurvePoint(temperature: 75, coolingLevel: 25),
+        FanControlCurvePoint(temperature: 85, coolingLevel: 50),
+        FanControlCurvePoint(temperature: 95, coolingLevel: 100),
+    ]
 
     static func isAutomaticMode(_ mode: UInt8) -> Bool {
         mode == 0 || mode == 3
@@ -261,7 +266,25 @@ enum FanControlPolicy {
             levels.append(interpolatedCoolingLevel(points: curve.points,
                                                    temperature: temperature))
         }
+        if let safetyLevel = safetyCoolingLevel(temperatures: temperatures) {
+            levels.append(safetyLevel)
+        }
         return levels.max()
+    }
+
+    static func safetyCoolingLevel(
+        temperatures: [FanControlTemperatureReading]
+    ) -> Int? {
+        let dieSources: Set<FanControlTemperatureSource> = [
+            .hottestSoC, .hottestCPU, .hottestGPU,
+        ]
+        guard let hottest = temperatures.lazy
+            .filter({ dieSources.contains($0.source) && validTemperature($0.celsius) })
+            .map(\.celsius)
+            .max(),
+            hottest >= Double(safetyCurvePoints[0].temperature) else { return nil }
+        return interpolatedCoolingLevel(points: safetyCurvePoints,
+                                        temperature: hottest)
     }
 
     static func interpolatedCoolingLevel(points: [FanControlCurvePoint],
@@ -334,13 +357,12 @@ enum FanControlPolicy {
     ) -> FanControlTemperatureReading? {
         let values = Dictionary(readings.map { ($0.key, $0.value) },
                                 uniquingKeysWith: { _, newest in newest })
-        for key in ["TCHP", "TC0P"] {
-            if let value = values[key], validTemperature(value) {
-                return FanControlTemperatureReading(source: .cpuProximity,
-                                                    celsius: value)
-            }
+        let proximity = ["TCHP", "TC0P"].compactMap { values[$0] }
+            .filter(validTemperature)
+            .max()
+        return proximity.map {
+            FanControlTemperatureReading(source: .cpuProximity, celsius: $0)
         }
-        return nil
     }
 
     static func aggregatedTemperatures(

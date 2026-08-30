@@ -231,11 +231,11 @@ struct FanControlCardContent: View {
                         .frame(width: 9)
                     Image(systemName: "thermometer.medium")
                         .foregroundStyle(.secondary)
-                    Text(strings.temperature)
+                    Text(headlineTemperature(in: sensors)?.name ?? strings.temperature)
                         .font(.system(size: 10.5, weight: .semibold))
                     Spacer()
-                    if let ambient = sensors.first(where: { $0.key == "TAOL" }) {
-                        Text(MetricFormat.temperature(ambient.celsius, unit: temperatureUnit))
+                    if let headline = headlineTemperature(in: sensors) {
+                        Text(MetricFormat.temperature(headline.celsius, unit: temperatureUnit))
                             .font(.system(size: 10, weight: .semibold).monospacedDigit())
                             .foregroundStyle(.secondary)
                     } else {
@@ -270,6 +270,21 @@ struct FanControlCardContent: View {
                 .padding(.top, 5)
             }
         }
+    }
+
+    private func headlineTemperature(
+        in sensors: [FanControlSensorReading]
+    ) -> (name: String, celsius: Double)? {
+        if let proximity = snapshot.temperatures?.first(where: { $0.source == .cpuProximity }) {
+            return ("CPU proximity", proximity.celsius)
+        }
+        if let hottestSoC = snapshot.temperatures?.first(where: { $0.source == .hottestSoC }) {
+            return ("Hottest SoC", hottestSoC.celsius)
+        }
+        if let hottest = sensors.max(by: { $0.celsius < $1.celsius }) {
+            return (hottest.name, hottest.celsius)
+        }
+        return nil
     }
 
     private func sensorIcon(_ sensor: FanControlSensorReading) -> some View {

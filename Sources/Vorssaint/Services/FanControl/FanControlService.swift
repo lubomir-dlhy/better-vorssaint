@@ -151,6 +151,7 @@ final class FanControlService: ObservableObject {
             self.isWorking = false
             guard let response else {
                 self.error = .helperUnavailable
+                self.invalidateTelemetry()
                 self.restoreAutomatic()
                 return
             }
@@ -183,6 +184,7 @@ final class FanControlService: ObservableObject {
             self.isWorking = false
             guard let response else {
                 self.error = .helperUnavailable
+                self.invalidateTelemetry()
                 return
             }
             self.apply(response)
@@ -271,6 +273,7 @@ final class FanControlService: ObservableObject {
             guard self.finishRequest(generation) else { return }
             guard let response else {
                 self.error = .helperUnavailable
+                self.invalidateTelemetry()
                 return
             }
             self.apply(response)
@@ -309,6 +312,9 @@ final class FanControlService: ObservableObject {
         operation(proxy) { data in
             finish(FanControlIPC.decode(data))
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            finish(nil)
+        }
     }
 
     private func proxy(errorHandler: @escaping (NSXPCConnection) -> Void) -> FanControlXPCProtocol? {
@@ -345,6 +351,7 @@ final class FanControlService: ObservableObject {
             guard self.finishRequest(generation) else { return }
             guard let response else {
                 self.error = .helperUnavailable
+                self.invalidateTelemetry()
                 return
             }
             self.apply(response)
@@ -358,6 +365,13 @@ final class FanControlService: ObservableObject {
     private func apply(_ response: FanControlResponse) {
         snapshot = response.snapshot
         error = response.error
+    }
+
+    private func invalidateTelemetry() {
+        var unavailable = snapshot
+        unavailable.temperatures = nil
+        unavailable.sensors = nil
+        snapshot = unavailable
     }
 
     private func beginRequest() -> Int {
@@ -528,7 +542,9 @@ final class FanControlService: ObservableObject {
             self.tickCount += 1
             if self.snapshot.isCooling {
                 self.heartbeat()
-            } else if self.panelIsVisible, self.error != .controlFailed,
+            } else if self.panelIsVisible,
+                      self.error != .controlFailed || self.snapshot.fans.isEmpty
+                          || self.accessState != .enabled,
                       self.tickCount.isMultiple(of: 2) {
                 self.refresh()
             }
