@@ -368,20 +368,25 @@ struct FanControlCardContent: View {
     private var statusText: String {
         guard snapshot.isCooling else { return strings.systemControl }
         let level = snapshot.coolingLevel ?? FanControlPolicy.defaultCoolingLevel
+        let target = snapshot.fans
+            .filter(\.isManuallyControlled)
+            .map(\.targetRPM)
+            .first
+            .map { String(format: strings.targetRPMFormat, Int($0.rounded())) }
         switch snapshot.configuration?.mode ?? .manual {
         case .system:
             return strings.systemControl
         case .manual:
-            return "\(strings.manualControl) · \(level)%"
+            return "\(strings.manualControl) · \(target ?? "\(level)%")"
         case .curve:
             let activeCurves = snapshot.configuration?.curves ?? []
             let temperature = activeCurves.count == 1
                 ? snapshot.temperatures?.first { $0.source == activeCurves[0].sensor }?.celsius
                 : nil
             if let temperature {
-                return "\(strings.customCurve) · \(MetricFormat.temperature(temperature, unit: temperatureUnit)) · \(level)%"
+                return "\(strings.customCurve) · \(MetricFormat.temperature(temperature, unit: temperatureUnit)) · \(target ?? "\(level)%")"
             }
-            return "\(strings.customCurve) · \(level)%"
+            return "\(strings.customCurve) · \(target ?? "\(level)%")"
         }
     }
 
