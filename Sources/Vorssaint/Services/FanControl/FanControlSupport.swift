@@ -36,6 +36,11 @@ struct FanControlTemperatureReading: Codable, Equatable, Sendable {
     let celsius: Double
 }
 
+struct FanControlSafetyDemand: Equatable, Sendable {
+    let celsius: Double
+    let coolingLevel: Int
+}
+
 struct FanControlSensorReading: Codable, Equatable, Identifiable, Sendable {
     let key: String
     let name: String
@@ -255,6 +260,19 @@ enum FanControlPolicy {
 
     private static func evaluatedCurveCoolingLevel(curves: [FanControlCurve],
                                                    temperatures: [FanControlTemperatureReading]) -> Int? {
+        guard let configured = configuredCurveCoolingLevel(curves: curves,
+                                                           temperatures: temperatures) else { return nil }
+        var levels = [configured]
+        if let safetyLevel = safetyCoolingLevel(temperatures: temperatures) {
+            levels.append(safetyLevel)
+        }
+        return levels.max()
+    }
+
+    static func configuredCurveCoolingLevel(
+        curves: [FanControlCurve],
+        temperatures: [FanControlTemperatureReading]
+    ) -> Int? {
         guard validCurves(curves) else { return nil }
         let values = Dictionary(temperatures.map { ($0.source, $0.celsius) },
                                 uniquingKeysWith: { _, newest in newest })
@@ -266,15 +284,18 @@ enum FanControlPolicy {
             levels.append(interpolatedCoolingLevel(points: curve.points,
                                                    temperature: temperature))
         }
-        if let safetyLevel = safetyCoolingLevel(temperatures: temperatures) {
-            levels.append(safetyLevel)
-        }
         return levels.max()
     }
 
     static func safetyCoolingLevel(
         temperatures: [FanControlTemperatureReading]
     ) -> Int? {
+        safetyDemand(temperatures: temperatures)?.coolingLevel
+    }
+
+    static func safetyDemand(
+        temperatures: [FanControlTemperatureReading]
+    ) -> FanControlSafetyDemand? {
         let dieSources: Set<FanControlTemperatureSource> = [
             .hottestSoC, .hottestCPU, .hottestGPU,
         ]
@@ -283,8 +304,11 @@ enum FanControlPolicy {
             .map(\.celsius)
             .max(),
             hottest >= Double(safetyCurvePoints[0].temperature) else { return nil }
-        return interpolatedCoolingLevel(points: safetyCurvePoints,
-                                        temperature: hottest)
+        return FanControlSafetyDemand(
+            celsius: hottest,
+            coolingLevel: interpolatedCoolingLevel(points: safetyCurvePoints,
+                                                    temperature: hottest)
+        )
     }
 
     static func interpolatedCoolingLevel(points: [FanControlCurvePoint],

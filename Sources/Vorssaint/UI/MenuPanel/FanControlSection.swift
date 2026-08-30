@@ -113,6 +113,19 @@ struct FanControlCardContent: View {
                                           temperatures: snapshot.temperatures ?? [],
                                           temperatureUnit: temperatureUnit,
                                           disabled: isWorking)
+                    if let safetyDemand = activeSafetyDemand {
+                        Label {
+                            Text(String(format: strings.safetyOverrideFormat,
+                                        MetricFormat.temperature(safetyDemand.celsius,
+                                                                 unit: temperatureUnit),
+                                        safetyDemand.coolingLevel))
+                        } icon: {
+                            Image(systemName: "thermometer.high")
+                        }
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
                     if !curveCanRun {
                         Text(strings.curveUnavailable)
                             .font(.system(size: 9.5))
@@ -424,6 +437,20 @@ struct FanControlCardContent: View {
     private var controlsCanAppear: Bool {
         !snapshot.fans.isEmpty
             && (error == nil || error == .controlFailed || snapshot.isCooling)
+    }
+
+    private var activeSafetyDemand: FanControlSafetyDemand? {
+        guard snapshot.isCooling,
+              snapshot.configuration?.mode == .curve,
+              let temperatures = snapshot.temperatures,
+              let activeCurves = snapshot.configuration?.curves,
+              let configured = FanControlPolicy.configuredCurveCoolingLevel(
+                  curves: activeCurves,
+                  temperatures: temperatures
+              ),
+              let safety = FanControlPolicy.safetyDemand(temperatures: temperatures),
+              safety.coolingLevel > configured else { return nil }
+        return safety
     }
 
     private var canConfigure: Bool {

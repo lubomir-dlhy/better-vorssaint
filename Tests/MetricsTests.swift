@@ -9738,6 +9738,14 @@ struct MetricsTests {
                     .init(source: .hottestCPU, celsius: 74.9),
                 ]) == nil,
                "die temperature safety floor overrides an under-reporting proximity curve")
+        expect(FanControlPolicy.configuredCurveCoolingLevel(
+                    curves: [defaultCurve],
+                    temperatures: [.init(source: .cpuProximity, celsius: 55)]
+                ) == 25
+                && FanControlPolicy.safetyDemand(temperatures: [
+                    .init(source: .hottestCPU, celsius: 87),
+                ]) == FanControlSafetyDemand(celsius: 87, coolingLevel: 60),
+               "the UI can distinguish curve demand from a hotter chip safety demand")
         let cpuCurve = FanControlCurve(
             sensor: .averageCPU,
             points: [FanControlCurvePoint(temperature: 40, coolingLevel: 0),
@@ -9886,7 +9894,7 @@ struct MetricsTests {
         for language in AppLanguage.allCases {
             let strings = FeatureStrings.fanControl(language)
             let values = Mirror(reflecting: strings).children.compactMap { $0.value as? String }
-            expect(values.count == 41 && values.allSatisfy { !$0.isEmpty },
+            expect(values.count == 42 && values.allSatisfy { !$0.isEmpty },
                    "fan control has every localized field for \(language.rawValue)")
             expect(values.allSatisfy { !$0.contains("—") },
                    "fan control text uses human punctuation for \(language.rawValue)")
@@ -9898,6 +9906,8 @@ struct MetricsTests {
                          "current fan speed format stays valid for \(language.rawValue)")
             expectFormat(strings.targetRPMFormat, ["d"],
                          "target fan speed format stays valid for \(language.rawValue)")
+            expectFormat(strings.safetyOverrideFormat, ["@", "d"],
+                         "fan safety override format stays valid for \(language.rawValue)")
         }
         expect(FanControlFeatureStrings.ru.rpmFormat == "%d об/мин"
                 && FanControlFeatureStrings.de.rpmFormat == "%d U/min"
