@@ -9746,6 +9746,20 @@ struct MetricsTests {
                     .init(source: .hottestCPU, celsius: 87),
                 ]) == FanControlSafetyDemand(celsius: 87, coolingLevel: 60),
                "the UI can distinguish curve demand from a hotter chip safety demand")
+        let dieSafetyTemperatures = FanControlPolicy.temperaturesIncludingDieSafety(
+            [
+                .init(source: .hottestSoC, celsius: 87),
+                .init(source: .hottestCPU, celsius: 86),
+                .init(source: .cpuProximity, celsius: 55),
+            ],
+            hardwareReadings: [("TCMb", 92), ("TCHP", 55)]
+        )
+        expect(dieSafetyTemperatures.first(where: { $0.source == .hottestSoC })?.celsius == 92
+                && dieSafetyTemperatures.first(where: { $0.source == .hottestCPU })?.celsius == 92
+                && dieSafetyTemperatures.first(where: { $0.source == .cpuProximity })?.celsius == 55
+                && FanControlPolicy.safetyDemand(temperatures: dieSafetyTemperatures)
+                    == FanControlSafetyDemand(celsius: 92, coolingLevel: 85),
+               "the visible CPU die sensor participates in the independent safety floor")
         let cpuCurve = FanControlCurve(
             sensor: .averageCPU,
             points: [FanControlCurvePoint(temperature: 40, coolingLevel: 0),

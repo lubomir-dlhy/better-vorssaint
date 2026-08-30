@@ -245,12 +245,17 @@ final class FanControlHardware {
     func readTemperatures() -> [FanControlTemperatureReading] {
         let keys = discoverTemperatureKeys()
         let cpuReadings = temperatureReadings(keys.cpu)
+        let hardwareReadings = rawHardwareTemperatures()
         var readings = FanControlPolicy.aggregatedTemperatures(
             cpuReadings: cpuReadings,
             gpuReadings: temperatureReadings(keys.gpu).map(\.value),
             platform: temperaturePlatform
         )
-        if let proximity = FanControlPolicy.cpuProximityReading(rawHardwareTemperatures()) {
+        readings = FanControlPolicy.temperaturesIncludingDieSafety(
+            readings,
+            hardwareReadings: hardwareReadings
+        )
+        if let proximity = FanControlPolicy.cpuProximityReading(hardwareReadings) {
             readings.append(proximity)
         }
         return readings

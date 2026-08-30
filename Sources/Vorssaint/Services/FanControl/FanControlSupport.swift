@@ -389,6 +389,30 @@ enum FanControlPolicy {
         }
     }
 
+    static func temperaturesIncludingDieSafety(
+        _ temperatures: [FanControlTemperatureReading],
+        hardwareReadings: [(key: String, value: Double)]
+    ) -> [FanControlTemperatureReading] {
+        let dieTemperature = hardwareReadings.lazy
+            .filter { $0.key == "TCMb" || $0.key == "TC0D" }
+            .map(\.value)
+            .filter(validTemperature)
+            .max()
+        guard let dieTemperature else { return temperatures }
+
+        var merged = temperatures
+        for source in [FanControlTemperatureSource.hottestSoC, .hottestCPU] {
+            if let index = merged.firstIndex(where: { $0.source == source }) {
+                if dieTemperature > merged[index].celsius {
+                    merged[index] = .init(source: source, celsius: dieTemperature)
+                }
+            } else {
+                merged.append(.init(source: source, celsius: dieTemperature))
+            }
+        }
+        return merged
+    }
+
     static func aggregatedTemperatures(
         cpuReadings: [(key: String, value: Double)],
         gpuReadings: [Double],
