@@ -29,7 +29,6 @@ final class FanControlService: ObservableObject {
     private var requestInFlight = false
     private var requestGeneration = 0
     private var tickCount = 0
-    private var registrationAttemptedVersion: String?
     private var observingWorkspace = false
 
     private static var appService: SMAppService {
@@ -82,7 +81,6 @@ final class FanControlService: ObservableObject {
     func refresh() {
         refreshAccessState()
         if accessState == .enabled {
-            guard !replaceRegistrationIfNeeded() else { return }
             requestStatus()
         } else {
             refreshLocalProbe()
@@ -398,43 +396,6 @@ final class FanControlService: ObservableObject {
         case .notFound: accessState = .notRegistered
         @unknown default: accessState = .unavailable
         }
-    }
-
-    /// Apple requires a changed embedded daemon to be unregistered before it
-    /// is registered again. This runs once per app build and only when the user
-    /// opens an already-authorized Fan Control surface.
-    private func replaceRegistrationIfNeeded() -> Bool {
-        let installed = UserDefaults.standard.string(forKey: DefaultsKey.fanControlHelperVersion) ?? ""
-        let current = Self.helperVersion
-        // An enabled helper without a saved version predates helper versioning
-        // (or was carried over while copying settings). Treat it as stale so
-        // the bundled daemon is installed before the first control request.
-        guard installed != current,
-              registrationAttemptedVersion != current,
-              !UserDefaults.standard.bool(forKey: DefaultsKey.fanControlRecoveryNeeded) else { return false }
-        registrationAttemptedVersion = current
-        isWorking = true
-        Self.appService.unregister { error in
-            DispatchQueue.main.async {
-                guard error == nil else {
-                    self.isWorking = false
-                    self.error = .helperUnavailable
-                    return
-                }
-                do {
-                    try Self.appService.register()
-                    UserDefaults.standard.set(current, forKey: DefaultsKey.fanControlHelperVersion)
-                    self.isWorking = false
-                    self.refreshAccessState()
-                    if self.accessState == .enabled { self.requestStatus() }
-                } catch {
-                    self.isWorking = false
-                    self.refreshAccessState()
-                    self.error = .helperUnavailable
-                }
-            }
-        }
-        return true
     }
 
     private func refreshLocalProbe() {
