@@ -29,6 +29,7 @@ final class FanControlService: ObservableObject {
     private var requestInFlight = false
     private var requestGeneration = 0
     private var tickCount = 0
+    private var processActivity: NSObjectProtocol?
     private var observingWorkspace = false
 
     private static var appService: SMAppService {
@@ -49,6 +50,9 @@ final class FanControlService: ObservableObject {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         connection?.invalidate()
         timer?.invalidate()
+        if let processActivity {
+            ProcessInfo.processInfo.endActivity(processActivity)
+        }
     }
 
     static func recoverIfNeeded() {
@@ -363,6 +367,20 @@ final class FanControlService: ObservableObject {
     private func apply(_ response: FanControlResponse) {
         snapshot = response.snapshot
         error = response.error
+        syncProcessActivity()
+    }
+
+    private func syncProcessActivity() {
+        if snapshot.isCooling {
+            guard processActivity == nil else { return }
+            processActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Vorssaint fan control heartbeat"
+            )
+        } else if let processActivity {
+            ProcessInfo.processInfo.endActivity(processActivity)
+            self.processActivity = nil
+        }
     }
 
     private func invalidateTelemetry() {
@@ -539,13 +557,27 @@ final class FanControlService: ObservableObject {
     }
 
     @objc private func workspaceWillSleep() {
-        if UserDefaults.standard.bool(forKey: DefaultsKey.fanControlRecoveryNeeded) {
+        let keepAwake = KeepAwakeManager.shared
+        if FanControlPolicy.shouldRestoreForWorkspaceSleep(
+            recoveryNeeded: UserDefaults.standard.bool(
+                forKey: DefaultsKey.fanControlRecoveryNeeded
+            ),
+            keepAwakeActive: keepAwake.isActive,
+            clamshellActive: keepAwake.clamshellActive
+        ) {
             restoreAutomatic(supersedingCurrentRequest: true)
         }
     }
 
     @objc private func workspaceDidWake() {
-        if UserDefaults.standard.bool(forKey: DefaultsKey.fanControlRecoveryNeeded) {
+        let keepAwake = KeepAwakeManager.shared
+        if FanControlPolicy.shouldRestoreForWorkspaceSleep(
+            recoveryNeeded: UserDefaults.standard.bool(
+                forKey: DefaultsKey.fanControlRecoveryNeeded
+            ),
+            keepAwakeActive: keepAwake.isActive,
+            clamshellActive: keepAwake.clamshellActive
+        ) {
             restoreAutomatic(supersedingCurrentRequest: true)
         } else if panelIsVisible {
             refresh()

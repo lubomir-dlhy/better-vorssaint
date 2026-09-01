@@ -9904,6 +9904,27 @@ struct MetricsTests {
                                               verificationFailures: 0,
                                               thermalState: .nominal) == nil,
                "a healthy maximum-cooling session remains active")
+        expect(!FanControlPolicy.shouldRestoreForWorkspaceSleep(
+                    recoveryNeeded: true,
+                    keepAwakeActive: true,
+                    clamshellActive: true
+                )
+                && FanControlPolicy.shouldRestoreForWorkspaceSleep(
+                    recoveryNeeded: true,
+                    keepAwakeActive: true,
+                    clamshellActive: false
+                )
+                && FanControlPolicy.shouldRestoreForWorkspaceSleep(
+                    recoveryNeeded: true,
+                    keepAwakeActive: false,
+                    clamshellActive: true
+                )
+                && !FanControlPolicy.shouldRestoreForWorkspaceSleep(
+                    recoveryNeeded: false,
+                    keepAwakeActive: false,
+                    clamshellActive: false
+                ),
+               "closed-lid Keep Awake sessions retain fan control across false sleep notifications")
 
         for language in AppLanguage.allCases {
             let strings = FeatureStrings.fanControl(language)
