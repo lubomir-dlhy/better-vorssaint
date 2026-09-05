@@ -239,14 +239,14 @@ private final class FanControlController {
         }
 
         do {
-            guard let level = requestedLevel(for: configuration, hardware: control) else {
+            guard let request = try control.coolingRequest(for: configuration) else {
                 finishFailedStart(mayHaveChangedHardware: false)
                 return .failure(.controlFailed)
             }
-            _ = try control.startCooling(level: level)
+            _ = try control.startCooling(request)
             owner = id
             isCooling = true
-            coolingLevel = level
+            coolingLevel = request.level
             activeConfiguration = configuration
             isRecovering = false
             let uptime = ProcessInfo.processInfo.systemUptime
@@ -277,13 +277,13 @@ private final class FanControlController {
     private func updateActiveConfiguration(_ configuration: FanControlConfiguration,
                                            duration: TimeInterval?) -> FanControlResponse {
         guard let hardware,
-              let level = requestedLevel(for: configuration, hardware: hardware) else {
+              let request = try? hardware.coolingRequest(for: configuration) else {
             return .failure(.controlFailed, snapshot: currentSnapshot())
         }
         do {
-            _ = try hardware.updateCooling(level: level)
+            _ = try hardware.updateCooling(request)
             activeConfiguration = configuration
-            coolingLevel = level
+            coolingLevel = request.level
             let uptime = ProcessInfo.processInfo.systemUptime
             endsAt = duration.map { Date().addingTimeInterval($0) }
             endsAtUptime = duration.map { uptime + $0 }
@@ -295,23 +295,6 @@ private final class FanControlController {
         } catch {
             _ = performRestore(reason: .hardwareChanged)
             return .failure(.controlFailed, snapshot: currentSnapshot())
-        }
-    }
-
-    private func requestedLevel(for configuration: FanControlConfiguration,
-                                hardware: FanControlHardware,
-                                previousLevel: Int? = nil) -> Int? {
-        switch configuration.mode {
-        case .system:
-            return nil
-        case .manual:
-            return configuration.manualLevel
-        case .curve:
-            return FanControlPolicy.curveCoolingLevel(
-                curves: configuration.curves,
-                temperatures: hardware.readTemperatures(),
-                previousLevel: previousLevel
-            )
         }
     }
 
@@ -413,15 +396,15 @@ private final class FanControlController {
         if activeConfiguration?.mode == .curve,
            let configuration = activeConfiguration,
            let hardware {
-            if let requested = requestedLevel(for: configuration, hardware: hardware,
-                                              previousLevel: coolingLevel) {
+            if let requested = try? hardware.coolingRequest(for: configuration) {
                 temperatureFailures = 0
-                if requested == coolingLevel {
+                if requested.level == coolingLevel
+                    && requested.targets == hardware.activeCoolingTargets {
                     controlIntact = hardware.coolingIsIntact()
                 } else {
                     do {
-                        _ = try hardware.updateCooling(level: requested)
-                        coolingLevel = requested
+                        _ = try hardware.updateCooling(requested)
+                        coolingLevel = requested.level
                         controlIntact = true
                     } catch {
                         controlIntact = false

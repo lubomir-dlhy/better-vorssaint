@@ -9682,8 +9682,10 @@ struct MetricsTests {
                 && FanControlPolicy.validCoolingLevel(55)
                 && FanControlPolicy.validCoolingLevel(100)
                 && !FanControlPolicy.validCoolingLevel(-5)
-                && !FanControlPolicy.validCoolingLevel(26),
-               "manual cooling accepts the full bounded five-percent scale")
+                && FanControlPolicy.validCoolingLevel(26)
+                && FanControlPolicy.validManualCoolingLevel(55)
+                && !FanControlPolicy.validManualCoolingLevel(26),
+               "sensor targets are precise while manual cooling uses five-percent steps")
         expect(FanControlPolicy.coolingTargetRPM(minimum: 1_200, maximum: 5_800,
                                                  level: 0) == 1_200
                 && FanControlPolicy.coolingTargetRPM(minimum: 1_200, maximum: 5_800,
@@ -9693,6 +9695,33 @@ struct MetricsTests {
                 && FanControlPolicy.coolingTargetRPM(minimum: 5_800, maximum: 5_800,
                                                      level: 100) == nil,
                "manual targets map the full percentage scale into reported hardware bounds")
+        expect(FanControlPolicy.sensorBasedTargetRPM(
+                    minimum: 2_500, maximum: 7_800,
+                    startTemperature: 50, maximumTemperature: 60,
+                    temperature: 49.9
+                ) == 2_500
+                && FanControlPolicy.sensorBasedTargetRPM(
+                    minimum: 2_500, maximum: 7_800,
+                    startTemperature: 50, maximumTemperature: 60,
+                    temperature: 55.9
+                ) == 5_150
+                && FanControlPolicy.sensorBasedTargetRPM(
+                    minimum: 2_500, maximum: 7_800,
+                    startTemperature: 50, maximumTemperature: 60,
+                    temperature: 60
+                ) == 7_800,
+               "sensor control uses the Macs Fan Control integer RPM-per-degree calculation")
+        expect(FanControlPolicy.sensorBasedRampLimitRPM(
+                    minimum: 2_500, maximum: 7_800,
+                    startTemperature: 50, maximumTemperature: 60
+                ) == 178
+                && FanControlPolicy.rampedSensorBasedTargetRPM(
+                    current: 3_000, desired: 5_150, limit: 178
+                ) == 3_178
+                && FanControlPolicy.rampedSensorBasedTargetRPM(
+                    current: 5_500, desired: 5_150, limit: 178
+                ) == 5_322,
+               "sensor targets move by the Macs Fan Control per-degree ramp increment")
 
         let defaultCurve = FanControlConfiguration.defaultCurve
         expect(defaultCurve.sensor == .cpuProximity
@@ -9713,31 +9742,31 @@ struct MetricsTests {
         ]
         expect(FanControlPolicy.curveCoolingLevel(curves: [defaultCurve],
                                                   temperatures: coolingTemperature,
-                                                  previousLevel: 50) == 50
+                                                  previousLevel: 50) == 45
                 && FanControlPolicy.curveCoolingLevel(
                     curves: [defaultCurve],
                     temperatures: [.init(source: .cpuProximity, celsius: 57)],
                     previousLevel: 50
-                ) == 45,
-               "a cooling curve uses two-degree hysteresis before lowering fan speed")
+                ) == 35,
+               "sensor-based control follows the selected whole-degree temperature directly")
         expect(FanControlPolicy.curveCoolingLevel(
                     curves: [defaultCurve],
                     temperatures: [
                         .init(source: .cpuProximity, celsius: 52),
                         .init(source: .hottestSoC, celsius: 85),
                     ]
-                ) == 50
+                ) == 10
                 && FanControlPolicy.curveCoolingLevel(
                     curves: [defaultCurve],
                     temperatures: [
                         .init(source: .cpuProximity, celsius: 52),
                         .init(source: .hottestGPU, celsius: 95),
                     ]
-                ) == 100
+                ) == 10
                 && FanControlPolicy.safetyCoolingLevel(temperatures: [
                     .init(source: .hottestCPU, celsius: 74.9),
                 ]) == nil,
-               "die temperature safety floor overrides an under-reporting proximity curve")
+               "sensor-based control does not silently substitute a hotter chip sensor")
         expect(FanControlPolicy.configuredCurveCoolingLevel(
                     curves: [defaultCurve],
                     temperatures: [.init(source: .cpuProximity, celsius: 55)]
@@ -9760,22 +9789,23 @@ struct MetricsTests {
                 && FanControlPolicy.safetyDemand(temperatures: dieSafetyTemperatures)
                     == FanControlSafetyDemand(celsius: 92, coolingLevel: 85),
                "the visible CPU die sensor participates in the independent safety floor")
-        let cpuCurve = FanControlCurve(
-            sensor: .averageCPU,
-            points: [FanControlCurvePoint(temperature: 40, coolingLevel: 0),
-                     FanControlCurvePoint(temperature: 80, coolingLevel: 80)]
+        let wirelessCurve = FanControlCurve(
+            sensor: .wirelessProximity,
+            points: [FanControlCurvePoint(temperature: 50, coolingLevel: 0),
+                     FanControlCurvePoint(temperature: 60, coolingLevel: 100)]
         )
         let curveTemperatures = [
             FanControlTemperatureReading(source: .cpuProximity, celsius: 54),
-            FanControlTemperatureReading(source: .averageCPU, celsius: 70),
+            FanControlTemperatureReading(source: .wirelessProximity, celsius: 56),
         ]
-        expect(FanControlPolicy.curveCoolingLevel(curves: [defaultCurve, cpuCurve],
+        expect(FanControlPolicy.curveCoolingLevel(curves: [wirelessCurve],
                                                   temperatures: curveTemperatures) == 60
-                && FanControlPolicy.curveCoolingLevel(curves: [defaultCurve, cpuCurve],
-                                                      temperatures: [curveTemperatures[0]]) == nil,
-               "several temperature rules use their highest demand and require every selected sensor")
+                && FanControlPolicy.curveCoolingLevel(curves: [wirelessCurve],
+                                                      temperatures: [curveTemperatures[0]]) == nil
+                && !FanControlPolicy.validCurves([defaultCurve, wirelessCurve]),
+               "sensor-based control uses exactly one selected sensor")
         let duplicateCurves = [defaultCurve,
-                               FanControlCurve(sensor: .cpuProximity, points: cpuCurve.points)]
+                               FanControlCurve(sensor: .cpuProximity, points: wirelessCurve.points)]
         let descendingCurve = FanControlCurve(
             sensor: .averageCPU,
             points: [FanControlCurvePoint(temperature: 50, coolingLevel: 80),
@@ -9805,6 +9835,13 @@ struct MetricsTests {
                     == .init(source: .cpuProximity, celsius: 48)
                 && FanControlPolicy.cpuProximityReading([("TCHP", .nan)]) == nil,
                "fan curves use the hottest valid CPU proximity sensor")
+        let rawControlTemperatures = FanControlPolicy.rawControlTemperatureReadings([
+            ("TW0P", 48), ("TaLP", 52), ("TCMb", 81),
+        ])
+        expect(rawControlTemperatures.first(where: { $0.source == .wirelessProximity })?.celsius == 48
+                && rawControlTemperatures.first(where: { $0.source == .leftAirflow })?.celsius == 52
+                && rawControlTemperatures.first(where: { $0.source == .cpuDieAverage })?.celsius == 81,
+               "raw SMC sensors are available to the sensor-based controller")
         expect(FanControlPolicy.telemetryReadings(expectedCount: 1, readings: [1_200]) == [1_200]
                 && FanControlPolicy.telemetryReadings(expectedCount: 2,
                                                       readings: [1_200, 1_350]) == [1_200, 1_350],

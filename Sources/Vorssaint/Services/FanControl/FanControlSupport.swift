@@ -22,6 +22,24 @@ enum FanControlMode: String, Codable, Sendable {
 
 enum FanControlTemperatureSource: String, Codable, CaseIterable, Identifiable, Sendable {
     case cpuProximity
+    case wirelessProximity
+    case ambientOutsideLid
+    case ambientAirflow
+    case leftAirflow
+    case rightAirflow
+    case leftAirflowProximity
+    case rightAirflowProximity
+    case topProximity
+    case battery1
+    case battery2
+    case battery3
+    case battery4
+    case cpuDieAverage
+    case cpuDie
+    case gpuDie
+    case gpuProximity
+    case storageProximity1
+    case storageProximity2
     case averageSoC
     case hottestSoC
     case averageCPU
@@ -39,6 +57,11 @@ struct FanControlTemperatureReading: Codable, Equatable, Sendable {
 struct FanControlSafetyDemand: Equatable, Sendable {
     let celsius: Double
     let coolingLevel: Int
+}
+
+struct FanControlCoolingRequest: Equatable, Sendable {
+    let level: Int
+    let targets: [Double]
 }
 
 struct FanControlSensorReading: Codable, Equatable, Identifiable, Sendable {
@@ -168,9 +191,9 @@ enum FanControlPolicy {
     static let minimumCurveTemperature = 20
     static let maximumCurveTemperature = 110
     static let minimumCurvePointCount = 2
-    static let maximumCurvePointCount = 8
-    static let maximumCurveCount = FanControlTemperatureSource.allCases.count
-    static let curveHysteresis = 2.0
+    static let maximumCurvePointCount = 2
+    static let maximumCurveCount = 1
+    static let minimumSensorTemperatureSpan = 8
     static let safetyCurvePoints = [
         FanControlCurvePoint(temperature: 75, coolingLevel: 25),
         FanControlCurvePoint(temperature: 85, coolingLevel: 50),
@@ -200,7 +223,10 @@ enum FanControlPolicy {
 
     static func validCoolingLevel(_ level: Int) -> Bool {
         (minimumCoolingLevel...maximumCoolingLevel).contains(level)
-            && level.isMultiple(of: coolingLevelStep)
+    }
+
+    static func validManualCoolingLevel(_ level: Int) -> Bool {
+        validCoolingLevel(level) && level.isMultiple(of: coolingLevelStep)
     }
 
     static func coolingTargetRPM(minimum: Double, maximum: Double,
@@ -210,25 +236,69 @@ enum FanControlPolicy {
         return minimum + (maximum - minimum) * Double(level) / 100
     }
 
+    static func sensorBasedTargetRPM(minimum: Double, maximum: Double,
+                                     startTemperature: Int, maximumTemperature: Int,
+                                     temperature: Double) -> Double? {
+        guard validBounds(minimum: minimum, maximum: maximum),
+              validTemperature(temperature),
+              (minimumCurveTemperature...maximumCurveTemperature).contains(startTemperature),
+              (minimumCurveTemperature...maximumCurveTemperature).contains(maximumTemperature),
+              maximumTemperature - startTemperature >= minimumSensorTemperatureSpan else {
+            return nil
+        }
+        let wholeTemperature = Int(temperature.rounded(.towardZero))
+        if wholeTemperature <= startTemperature { return minimum }
+        if wholeTemperature >= maximumTemperature { return maximum }
+        let rpmPerDegree = Int((maximum - minimum)
+            / Double(maximumTemperature - startTemperature))
+        return min(maximum, max(minimum,
+            minimum + Double((wholeTemperature - startTemperature) * rpmPerDegree)))
+    }
+
+    static func sensorBasedRampLimitRPM(minimum: Double, maximum: Double,
+                                        startTemperature: Int,
+                                        maximumTemperature: Int) -> Double? {
+        guard validBounds(minimum: minimum, maximum: maximum),
+              maximumTemperature - startTemperature >= minimumSensorTemperatureSpan else {
+            return nil
+        }
+        let rpmPerDegree = Int((maximum - minimum)
+            / Double(maximumTemperature - startTemperature))
+        return Double(max(2, rpmPerDegree / 3 + 2))
+    }
+
+    static func rampedSensorBasedTargetRPM(current: Double, desired: Double,
+                                           limit: Double) -> Double {
+        guard current.isFinite, desired.isFinite, limit.isFinite, limit > 0 else {
+            return desired
+        }
+        if desired > current { return min(desired, current + limit) }
+        if desired < current { return max(desired, current - limit) }
+        return desired
+    }
+
     static func validConfiguration(_ configuration: FanControlConfiguration) -> Bool {
         switch configuration.mode {
         case .system:
             return true
         case .manual:
-            return validCoolingLevel(configuration.manualLevel)
+            return validManualCoolingLevel(configuration.manualLevel)
         case .curve:
             return validCurves(configuration.curves)
         }
     }
 
     static func validCurves(_ curves: [FanControlCurve]) -> Bool {
-        guard (1...maximumCurveCount).contains(curves.count),
-              Set(curves.map(\.sensor)).count == curves.count else { return false }
+        guard curves.count == maximumCurveCount else { return false }
         return curves.allSatisfy(validCurve)
     }
 
     static func validCurve(_ curve: FanControlCurve) -> Bool {
-        guard (minimumCurvePointCount...maximumCurvePointCount).contains(curve.points.count) else {
+        guard curve.points.count == minimumCurvePointCount,
+              curve.points[0].coolingLevel == minimumCoolingLevel,
+              curve.points[1].coolingLevel == maximumCoolingLevel,
+              curve.points[1].temperature - curve.points[0].temperature
+                >= minimumSensorTemperatureSpan else {
             return false
         }
         for (index, point) in curve.points.enumerated() {
@@ -246,27 +316,10 @@ enum FanControlPolicy {
     static func curveCoolingLevel(curves: [FanControlCurve],
                                   temperatures: [FanControlTemperatureReading],
                                   previousLevel: Int? = nil) -> Int? {
-        guard let requested = evaluatedCurveCoolingLevel(curves: curves,
-                                                         temperatures: temperatures) else { return nil }
-        guard let previousLevel, requested < previousLevel else { return requested }
-        let warmerReadings = temperatures.map {
-            FanControlTemperatureReading(source: $0.source,
-                                         celsius: $0.celsius + curveHysteresis)
-        }
-        guard let held = evaluatedCurveCoolingLevel(curves: curves,
-                                                    temperatures: warmerReadings) else { return nil }
-        return min(previousLevel, max(requested, held))
-    }
-
-    private static func evaluatedCurveCoolingLevel(curves: [FanControlCurve],
-                                                   temperatures: [FanControlTemperatureReading]) -> Int? {
-        guard let configured = configuredCurveCoolingLevel(curves: curves,
-                                                           temperatures: temperatures) else { return nil }
-        var levels = [configured]
-        if let safetyLevel = safetyCoolingLevel(temperatures: temperatures) {
-            levels.append(safetyLevel)
-        }
-        return levels.max()
+        // Macs Fan Control's sensor mode follows the selected sensor only.
+        // Safety is handled independently by the helper watchdog and macOS
+        // thermal pressure, never by silently substituting a different sensor.
+        configuredCurveCoolingLevel(curves: curves, temperatures: temperatures)
     }
 
     static func configuredCurveCoolingLevel(
@@ -276,15 +329,11 @@ enum FanControlPolicy {
         guard validCurves(curves) else { return nil }
         let values = Dictionary(temperatures.map { ($0.source, $0.celsius) },
                                 uniquingKeysWith: { _, newest in newest })
-        var levels: [Int] = []
-        for curve in curves {
-            guard let temperature = values[curve.sensor], validTemperature(temperature) else {
-                return nil
-            }
-            levels.append(interpolatedCoolingLevel(points: curve.points,
-                                                   temperature: temperature))
+        guard let curve = curves.first,
+              let temperature = values[curve.sensor], validTemperature(temperature) else {
+            return nil
         }
-        return levels.max()
+        return interpolatedCoolingLevel(points: curve.points, temperature: temperature)
     }
 
     static func safetyCoolingLevel(
@@ -322,13 +371,15 @@ enum FanControlPolicy {
             let upper = points[index]
             guard temperature <= Double(upper.temperature) else { continue }
             let lower = points[index - 1]
-            let progress = (temperature - Double(lower.temperature))
+            // Macs Fan Control evaluates whole Celsius degrees and truncates
+            // the linear step. This avoids the old upward 5% bias.
+            let wholeTemperature = temperature.rounded(.towardZero)
+            let wholeProgress = (wholeTemperature - Double(lower.temperature))
                 / Double(upper.temperature - lower.temperature)
             let raw = Double(lower.coolingLevel)
-                + Double(upper.coolingLevel - lower.coolingLevel) * progress
-            let stepped = Int(ceil(raw / Double(coolingLevelStep) - 1e-9))
-                * coolingLevelStep
-            return min(maximumCoolingLevel, max(minimumCoolingLevel, stepped))
+                + Double(upper.coolingLevel - lower.coolingLevel) * wholeProgress
+            return min(maximumCoolingLevel,
+                       max(minimumCoolingLevel, Int(raw.rounded(.down))))
         }
         return last.coolingLevel
     }
@@ -386,6 +437,38 @@ enum FanControlPolicy {
             .max()
         return proximity.map {
             FanControlTemperatureReading(source: .cpuProximity, celsius: $0)
+        }
+    }
+
+    static func rawControlTemperatureReadings(
+        _ readings: [(key: String, value: Double)]
+    ) -> [FanControlTemperatureReading] {
+        let values = Dictionary(readings.map { ($0.key, $0.value) },
+                                uniquingKeysWith: { _, newest in newest })
+        let mappings: [(FanControlTemperatureSource, [String])] = [
+            (.wirelessProximity, ["TW0P"]),
+            (.ambientOutsideLid, ["TAOL"]),
+            (.ambientAirflow, ["TA0P"]),
+            (.leftAirflow, ["TaLP"]),
+            (.rightAirflow, ["TaRF"]),
+            (.leftAirflowProximity, ["TaLW"]),
+            (.rightAirflowProximity, ["TaRW"]),
+            (.topProximity, ["TaTP"]),
+            (.battery1, ["TB0T"]),
+            (.battery2, ["TB1T"]),
+            (.battery3, ["TB2T"]),
+            (.battery4, ["TB3T"]),
+            (.cpuDieAverage, ["TCMb"]),
+            (.cpuDie, ["TC0D"]),
+            (.gpuDie, ["TG0D"]),
+            (.gpuProximity, ["TG0P"]),
+            (.storageProximity1, ["Ts0P"]),
+            (.storageProximity2, ["Ts1P"]),
+        ]
+        return mappings.compactMap { source, keys in
+            guard let value = keys.compactMap({ values[$0] })
+                .filter(validTemperature).max() else { return nil }
+            return FanControlTemperatureReading(source: source, celsius: value)
         }
     }
 

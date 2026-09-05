@@ -49,6 +49,7 @@ final class FanControlHardware {
     private var cachedForceTestKey: SMCClient.Key?
     private var didDiscoverForceTestKey = false
     private var activeTargets: [Double] = []
+    var activeCoolingTargets: [Double] { activeTargets }
     private var temperatureKeys: TemperatureKeys?
     private let temperaturePlatform = TemperatureSensorSelector.currentPlatform()
 
@@ -95,7 +96,64 @@ final class FanControlHardware {
                                   sensors: readHardwareTemperatures())
     }
 
-    func startCooling(level: Int) throws -> [FanControlFanReading] {
+    func coolingRequest(for configuration: FanControlConfiguration) throws
+        -> FanControlCoolingRequest? {
+        let fans = try discoverControlledFans()
+        switch configuration.mode {
+        case .system:
+            return nil
+        case .manual:
+            let level = configuration.manualLevel
+            let targets = fans.compactMap {
+                FanControlPolicy.coolingTargetRPM(minimum: $0.minimumRPM,
+                                                  maximum: $0.maximumRPM,
+                                                  level: level)
+            }
+            guard targets.count == fans.count else { return nil }
+            return FanControlCoolingRequest(level: level, targets: targets)
+        case .curve:
+            guard FanControlPolicy.validCurves(configuration.curves),
+                  let curve = configuration.curves.first,
+                  let start = curve.points.first?.temperature,
+                  let maximum = curve.points.last?.temperature else { return nil }
+            let temperatures = readTemperatures()
+            guard let reading = temperatures.first(where: { $0.source == curve.sensor }),
+                  let level = FanControlPolicy.curveCoolingLevel(
+                    curves: configuration.curves,
+                    temperatures: temperatures
+                  ) else { return nil }
+            let previousTargets: [Double] = activeTargets.count == fans.count
+                ? activeTargets
+                : fans.map { client.readValue($0.actual) ?? $0.minimumRPM }
+            let wholeTemperature = Int(reading.celsius.rounded(.towardZero))
+            let targets = zip(fans, previousTargets).compactMap { pair -> Double? in
+                let (fan, current) = pair
+                guard let desired = FanControlPolicy.sensorBasedTargetRPM(
+                    minimum: fan.minimumRPM,
+                    maximum: fan.maximumRPM,
+                    startTemperature: start,
+                    maximumTemperature: maximum,
+                    temperature: reading.celsius
+                ) else { return nil }
+                guard wholeTemperature > start, wholeTemperature < maximum,
+                      let limit = FanControlPolicy.sensorBasedRampLimitRPM(
+                        minimum: fan.minimumRPM,
+                        maximum: fan.maximumRPM,
+                        startTemperature: start,
+                        maximumTemperature: maximum
+                      ) else { return desired }
+                return FanControlPolicy.rampedSensorBasedTargetRPM(
+                    current: min(fan.maximumRPM, max(fan.minimumRPM, current)),
+                    desired: desired,
+                    limit: limit
+                )
+            }
+            guard targets.count == fans.count else { return nil }
+            return FanControlCoolingRequest(level: level, targets: targets)
+        }
+    }
+
+    func startCooling(_ request: FanControlCoolingRequest) throws -> [FanControlFanReading] {
         let fans = try discoverControlledFans()
         guard try fans.allSatisfy({ try FanControlPolicy.isAutomaticMode(modeValue($0.mode)) }) else {
             throw FanControlHardwareError.alreadyControlled
@@ -104,16 +162,12 @@ final class FanControlHardware {
             throw FanControlHardwareError.alreadyControlled
         }
 
-        let targets = try fans.map { fan -> Double in
-            guard let target = FanControlPolicy.coolingTargetRPM(
-                    minimum: fan.minimumRPM,
-                    maximum: fan.maximumRPM,
-                    level: level
-                  ) else {
-                throw FanControlHardwareError.operationFailed
-            }
-            return target
-        }
+        guard FanControlPolicy.validCoolingLevel(request.level),
+              request.targets.count == fans.count,
+              zip(fans, request.targets).allSatisfy({ fan, target in
+                  target.isFinite && target >= fan.minimumRPM && target <= fan.maximumRPM
+              }) else { throw FanControlHardwareError.operationFailed }
+        let targets = request.targets
 
         // Engage and verify manual mode before writing a target. In particular,
         // M5 firmware may accept F*md while rejecting an immediately adjacent
@@ -161,21 +215,18 @@ final class FanControlHardware {
         return try readings(for: fans)
     }
 
-    func updateCooling(level: Int) throws -> [FanControlFanReading] {
+    func updateCooling(_ request: FanControlCoolingRequest) throws -> [FanControlFanReading] {
         let fans = try discoverControlledFans()
-        guard FanControlPolicy.validCoolingLevel(level),
+        guard FanControlPolicy.validCoolingLevel(request.level),
               activeTargets.count == fans.count,
+              request.targets.count == fans.count,
               fans.allSatisfy({ (try? modeValue($0.mode)) == 1 }) else {
             throw FanControlHardwareError.operationFailed
         }
-        let targets = try fans.map { fan -> Double in
-            guard let target = FanControlPolicy.coolingTargetRPM(
-                minimum: fan.minimumRPM,
-                maximum: fan.maximumRPM,
-                level: level
-            ) else { throw FanControlHardwareError.operationFailed }
-            return target
-        }
+        guard zip(fans, request.targets).allSatisfy({ fan, target in
+            target.isFinite && target >= fan.minimumRPM && target <= fan.maximumRPM
+        }) else { throw FanControlHardwareError.operationFailed }
+        let targets = request.targets
         for (fan, target) in zip(fans, targets) {
             guard setValue(target, for: fan.target, attempts: 10) else {
                 throw FanControlHardwareError.operationFailed
@@ -258,6 +309,8 @@ final class FanControlHardware {
         if let proximity = FanControlPolicy.cpuProximityReading(hardwareReadings) {
             readings.append(proximity)
         }
+        readings.append(contentsOf:
+            FanControlPolicy.rawControlTemperatureReadings(hardwareReadings))
         return readings
     }
 

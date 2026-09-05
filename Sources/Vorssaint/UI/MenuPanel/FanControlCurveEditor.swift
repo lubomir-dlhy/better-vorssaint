@@ -12,34 +12,9 @@ struct FanControlCurveEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            ForEach(curves.indices, id: \.self) { index in
-                curveRule(at: index)
-                if index < curves.count - 1 { Divider().opacity(0.55) }
-            }
-
-            if let source = nextAvailableSource {
-                Button {
-                    curves.append(FanControlCurve(
-                        sensor: source,
-                        points: FanControlConfiguration.defaultCurve.points
-                    ))
-                } label: {
-                    Label(strings.addSensor, systemImage: "plus.circle")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .disabled(disabled)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func curveRule(at curveIndex: Int) -> some View {
-        let curve = curveBinding(at: curveIndex)
-        VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
-                Picker(strings.sensor, selection: curve.sensor) {
-                    ForEach(sourceOptions(at: curveIndex)) { source in
+                Picker(strings.sensor, selection: sensorBinding) {
+                    ForEach(sourceOptions) { source in
                         Label(sourceName(source), systemImage: sourceIcon(source)).tag(source)
                     }
                 }
@@ -50,165 +25,137 @@ struct FanControlCurveEditor: View {
 
                 Spacer(minLength: 4)
 
-                if let temperature = temperature(for: curve.wrappedValue.sensor) {
+                if let temperature = temperature(for: normalizedCurve.sensor) {
                     Text(formattedTemperature(temperature))
                         .font(.system(size: 10, weight: .semibold).monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
 
-                if curves.count > 1 {
-                    Button {
-                        curves.remove(at: curveIndex)
-                    } label: {
-                        Image(systemName: "minus.circle")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .help(strings.removeSensor)
-                    .accessibilityLabel(strings.removeSensor)
-                    .disabled(disabled)
-                }
             }
 
-            FanControlCurveGraph(points: curve.points,
+            FanControlCurveGraph(points: .constant(normalizedCurve.points),
                                  accessibilityLabel: strings.curveGraph,
-                                 disabled: disabled)
+                                 disabled: true)
                 .frame(height: 92)
 
-            HStack {
-                Text(strings.temperature)
-                Spacer()
-                Text(strings.fanSpeed)
-                Spacer().frame(width: 20)
+            thresholdRow(
+                title: "Fan speed starts increasing at",
+                value: startTemperatureBinding,
+                range: FanControlPolicy.minimumCurveTemperature ... max(
+                    FanControlPolicy.minimumCurveTemperature,
+                    maximumTemperature - FanControlPolicy.minimumSensorTemperatureSpan
+                )
+            )
+            thresholdRow(
+                title: "Maximum fan speed at",
+                value: maximumTemperatureBinding,
+                range: min(
+                    FanControlPolicy.maximumCurveTemperature,
+                    startTemperature + FanControlPolicy.minimumSensorTemperatureSpan
+                ) ... FanControlPolicy.maximumCurveTemperature
+            )
+
+            HStack(spacing: 5) {
+                Image(systemName: "info.circle")
+                Text("Below the first temperature the fan uses its hardware minimum. Between the two temperatures RPM rises linearly; at the maximum temperature it uses the hardware maximum.")
             }
-            .font(.system(size: 9.5))
+            .font(.system(size: 9.25))
             .foregroundStyle(.secondary)
-
-            ForEach(curve.wrappedValue.points.indices, id: \.self) { pointIndex in
-                pointRow(curveIndex: curveIndex, pointIndex: pointIndex)
-            }
-
-            if curve.wrappedValue.points.count < FanControlPolicy.maximumCurvePointCount,
-               nextPoint(for: curve.wrappedValue.points) != nil {
-                Button {
-                    guard let point = nextPoint(for: curves[curveIndex].points) else { return }
-                    curves[curveIndex].points.append(point)
-                    curves[curveIndex].points.sort { $0.temperature < $1.temperature }
-                } label: {
-                    Label(strings.addPoint, systemImage: "plus")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.mini)
-                .disabled(disabled)
-            }
+            .fixedSize(horizontal: false, vertical: true)
         }
+        .onAppear { persistNormalizedCurve() }
     }
 
-    private func pointRow(curveIndex: Int, pointIndex: Int) -> some View {
-        let point = curves[curveIndex].points[pointIndex]
-        return HStack(spacing: 5) {
-            Text(formattedTemperature(Double(point.temperature)))
-                .font(.system(size: 10).monospacedDigit())
+    private func thresholdRow(title: String, value: Binding<Int>,
+                              range: ClosedRange<Int>) -> some View {
+        HStack(spacing: 7) {
+            Text(title)
+                .font(.system(size: 10.5))
+            Spacer(minLength: 8)
+            Text(formattedTemperature(Double(value.wrappedValue)))
+                .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
                 .frame(width: 42, alignment: .trailing)
-            Stepper(strings.temperature,
-                    value: temperatureBinding(curveIndex: curveIndex,
-                                              pointIndex: pointIndex),
-                    in: temperatureRange(curveIndex: curveIndex, pointIndex: pointIndex))
+            Stepper(title, value: value, in: range)
                 .labelsHidden()
                 .controlSize(.mini)
-                .accessibilityValue(formattedTemperature(Double(point.temperature)))
+                .accessibilityValue(formattedTemperature(Double(value.wrappedValue)))
                 .disabled(disabled)
+        }
+    }
 
-            Spacer(minLength: 4)
+    private var normalizedCurve: FanControlCurve {
+        guard let stored = curves.first else { return FanControlConfiguration.defaultCurve }
+        let sorted = stored.points.sorted { $0.temperature < $1.temperature }
+        let start = min(FanControlPolicy.maximumCurveTemperature
+                            - FanControlPolicy.minimumSensorTemperatureSpan,
+                        max(FanControlPolicy.minimumCurveTemperature,
+                            sorted.first?.temperature
+                                ?? FanControlConfiguration.defaultCurve.points[0].temperature))
+        let maximum = min(FanControlPolicy.maximumCurveTemperature,
+                          max(start + FanControlPolicy.minimumSensorTemperatureSpan,
+                              sorted.last?.temperature
+                                ?? FanControlConfiguration.defaultCurve.points[1].temperature))
+        return FanControlCurve(
+            sensor: stored.sensor,
+            points: [
+                FanControlCurvePoint(temperature: start, coolingLevel: 0),
+                FanControlCurvePoint(temperature: maximum, coolingLevel: 100),
+            ]
+        )
+    }
 
-            Text("\(point.coolingLevel)%")
-                .font(.system(size: 10).monospacedDigit())
-                .frame(width: 34, alignment: .trailing)
-            Stepper(strings.fanSpeed,
-                    value: levelBinding(curveIndex: curveIndex,
-                                        pointIndex: pointIndex),
-                    in: levelRange(curveIndex: curveIndex, pointIndex: pointIndex),
-                    step: FanControlPolicy.coolingLevelStep)
-                .labelsHidden()
-                .controlSize(.mini)
-                .accessibilityValue("\(point.coolingLevel)%")
-                .disabled(disabled)
+    private func persistNormalizedCurve() {
+        let normalized = normalizedCurve
+        if curves != [normalized] { curves = [normalized] }
+    }
 
-            Button {
-                curves[curveIndex].points.remove(at: pointIndex)
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
+    private var sensorBinding: Binding<FanControlTemperatureSource> {
+        Binding(
+            get: { normalizedCurve.sensor },
+            set: { sensor in
+                var updated = normalizedCurve
+                updated.sensor = sensor
+                curves = [updated]
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .frame(width: 16)
-            .help(strings.removePoint)
-            .accessibilityLabel(strings.removePoint)
-            .disabled(disabled
-                      || curves[curveIndex].points.count <= FanControlPolicy.minimumCurvePointCount)
-        }
-    }
-
-    private func curveBinding(at index: Int) -> Binding<FanControlCurve> {
-        Binding(
-            get: { curves[index] },
-            set: { curves[index] = $0 }
         )
     }
 
-    private func temperatureBinding(curveIndex: Int, pointIndex: Int) -> Binding<Int> {
+    private var startTemperatureBinding: Binding<Int> {
         Binding(
-            get: { curves[curveIndex].points[pointIndex].temperature },
-            set: { curves[curveIndex].points[pointIndex].temperature = $0 }
+            get: { startTemperature },
+            set: { value in
+                var updated = normalizedCurve
+                updated.points[0].temperature = value
+                curves = [updated]
+            }
         )
     }
 
-    private func levelBinding(curveIndex: Int, pointIndex: Int) -> Binding<Int> {
+    private var maximumTemperatureBinding: Binding<Int> {
         Binding(
-            get: { curves[curveIndex].points[pointIndex].coolingLevel },
-            set: { curves[curveIndex].points[pointIndex].coolingLevel = $0 }
+            get: { maximumTemperature },
+            set: { value in
+                var updated = normalizedCurve
+                updated.points[1].temperature = value
+                curves = [updated]
+            }
         )
     }
 
-    private func temperatureRange(curveIndex: Int, pointIndex: Int) -> ClosedRange<Int> {
-        let points = curves[curveIndex].points
-        let lower = pointIndex == 0
-            ? FanControlPolicy.minimumCurveTemperature
-            : points[pointIndex - 1].temperature + 1
-        let upper = pointIndex == points.count - 1
-            ? FanControlPolicy.maximumCurveTemperature
-            : points[pointIndex + 1].temperature - 1
-        return lower...upper
+    private var startTemperature: Int {
+        normalizedCurve.points[0].temperature
     }
 
-    private func levelRange(curveIndex: Int, pointIndex: Int) -> ClosedRange<Int> {
-        let points = curves[curveIndex].points
-        let lower = pointIndex == 0
-            ? FanControlPolicy.minimumCoolingLevel
-            : points[pointIndex - 1].coolingLevel
-        let upper = pointIndex == points.count - 1
-            ? FanControlPolicy.maximumCoolingLevel
-            : points[pointIndex + 1].coolingLevel
-        return lower...upper
+    private var maximumTemperature: Int {
+        normalizedCurve.points[1].temperature
     }
 
-    private func sourceOptions(at index: Int) -> [FanControlTemperatureSource] {
-        let current = curves[index].sensor
+    private var sourceOptions: [FanControlTemperatureSource] {
+        let current = normalizedCurve.sensor
         let detected = Set(temperatures.map(\.source))
-        let base = detected.isEmpty ? Set(FanControlTemperatureSource.allCases) : detected
-        let used = Set(curves.enumerated().compactMap { $0.offset == index ? nil : $0.element.sensor })
         return FanControlTemperatureSource.allCases.filter {
-            ($0 == current || (base.contains($0) && !used.contains($0)))
+            $0 == current || detected.isEmpty || detected.contains($0)
         }
-    }
-
-    private var nextAvailableSource: FanControlTemperatureSource? {
-        let used = Set(curves.map(\.sensor))
-        let detected = Set(temperatures.map(\.source))
-        let candidates = detected.isEmpty ? FanControlTemperatureSource.allCases
-                                          : FanControlTemperatureSource.allCases.filter(detected.contains)
-        return candidates.first { !used.contains($0) }
     }
 
     private func temperature(for source: FanControlTemperatureSource) -> Double? {
@@ -222,6 +169,24 @@ struct FanControlCurveEditor: View {
     private func sourceName(_ source: FanControlTemperatureSource) -> String {
         switch source {
         case .cpuProximity: return "CPU Proximity"
+        case .wirelessProximity: return "Wireless Proximity"
+        case .ambientOutsideLid: return "Ambient outside lid"
+        case .ambientAirflow: return "Ambient airflow"
+        case .leftAirflow: return "Left airflow"
+        case .rightAirflow: return "Right airflow"
+        case .leftAirflowProximity: return "Left airflow proximity"
+        case .rightAirflowProximity: return "Right airflow proximity"
+        case .topProximity: return "Top proximity"
+        case .battery1: return "Battery 1"
+        case .battery2: return "Battery 2"
+        case .battery3: return "Battery 3"
+        case .battery4: return "Battery 4"
+        case .cpuDieAverage: return "CPU die average"
+        case .cpuDie: return "CPU die"
+        case .gpuDie: return "GPU die"
+        case .gpuProximity: return "GPU proximity"
+        case .storageProximity1: return "Storage proximity 1"
+        case .storageProximity2: return "Storage proximity 2"
         case .averageSoC: return strings.averageSoC
         case .hottestSoC: return strings.hottestSoC
         case .averageCPU: return strings.averageCPU
@@ -232,41 +197,15 @@ struct FanControlCurveEditor: View {
 
     private func sourceIcon(_ source: FanControlTemperatureSource) -> String {
         switch source {
-        case .cpuProximity, .averageCPU, .hottestCPU: return "cpu"
-        case .hottestGPU: return "rectangle.3.group"
+        case .cpuProximity, .cpuDieAverage, .cpuDie, .averageCPU, .hottestCPU: return "cpu"
+        case .gpuDie, .gpuProximity, .hottestGPU: return "rectangle.3.group"
+        case .wirelessProximity: return "wifi"
+        case .ambientOutsideLid, .ambientAirflow, .leftAirflow, .rightAirflow,
+             .leftAirflowProximity, .rightAirflowProximity, .topProximity: return "wind"
+        case .battery1, .battery2, .battery3, .battery4: return "battery.75percent"
+        case .storageProximity1, .storageProximity2: return "internaldrive"
         case .averageSoC, .hottestSoC: return "cpu.fill"
         }
-    }
-
-    private func nextPoint(for points: [FanControlCurvePoint]) -> FanControlCurvePoint? {
-        guard let first = points.first, let last = points.last else { return nil }
-        var best: (index: Int, gap: Int)?
-        for index in 1..<points.count {
-            let gap = points[index].temperature - points[index - 1].temperature
-            if gap > 1, gap > (best?.gap ?? 0) { best = (index, gap) }
-        }
-        if let best {
-            let lower = points[best.index - 1]
-            let upper = points[best.index]
-            let temperature = lower.temperature + best.gap / 2
-            let rawLevel = Double(lower.coolingLevel + upper.coolingLevel) / 2
-            let level = Int((rawLevel / Double(FanControlPolicy.coolingLevelStep)).rounded())
-                * FanControlPolicy.coolingLevelStep
-            return FanControlCurvePoint(temperature: temperature, coolingLevel: level)
-        }
-        if last.temperature < FanControlPolicy.maximumCurveTemperature {
-            return FanControlCurvePoint(
-                temperature: min(FanControlPolicy.maximumCurveTemperature, last.temperature + 10),
-                coolingLevel: last.coolingLevel
-            )
-        }
-        if first.temperature > FanControlPolicy.minimumCurveTemperature {
-            return FanControlCurvePoint(
-                temperature: max(FanControlPolicy.minimumCurveTemperature, first.temperature - 10),
-                coolingLevel: first.coolingLevel
-            )
-        }
-        return nil
     }
 }
 
