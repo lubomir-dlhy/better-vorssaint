@@ -9981,6 +9981,16 @@ struct MetricsTests {
                     clamshellActive: true
                 ),
                "a retained closed-lid fan session refreshes its SMC connection after wake")
+        expect(FanControlPolicy.controlledFansAreSpinning(
+                    expectedCount: 2, readings: [4_500, 4_520]
+                )
+                && !FanControlPolicy.controlledFansAreSpinning(
+                    expectedCount: 2, readings: [4_500, 0]
+                )
+                && !FanControlPolicy.controlledFansAreSpinning(
+                    expectedCount: 2, readings: [4_500, nil]
+                ),
+               "manual fan control rejects persistent zero or missing tachometer readings")
 
         for language in AppLanguage.allCases {
             let strings = FeatureStrings.fanControl(language)

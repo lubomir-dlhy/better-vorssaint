@@ -307,6 +307,10 @@ final class FanControlHardware {
     func coolingIsIntact() -> Bool {
         guard let fans = try? discoverControlledFans() else { return false }
         return verifyCooling(fans, targets: activeTargets)
+            && FanControlPolicy.controlledFansAreSpinning(
+                expectedCount: fans.count,
+                readings: fans.map { client.readValue($0.actual) }
+            )
     }
 
     func readTemperatures() -> [FanControlTemperatureReading] {

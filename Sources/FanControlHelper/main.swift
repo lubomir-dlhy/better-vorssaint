@@ -463,7 +463,7 @@ private final class FanControlController {
                     do {
                         _ = try hardware.updateCooling(requested)
                         coolingLevel = requested.level
-                        controlIntact = true
+                        controlIntact = hardware.coolingIsIntact()
                     } catch {
                         controlIntact = false
                     }
