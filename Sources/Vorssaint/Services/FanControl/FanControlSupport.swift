@@ -545,13 +545,6 @@ enum FanControlPolicy {
         return values
     }
 
-    static func controlledFansAreSpinning(expectedCount: Int,
-                                           readings: [Double?]) -> Bool {
-        guard let values = telemetryReadings(expectedCount: expectedCount,
-                                             readings: readings) else { return false }
-        return values.allSatisfy { $0 > 0 }
-    }
-
     static func menuBarValue(for speeds: [Double]) -> String? {
         guard !speeds.isEmpty, speeds.allSatisfy(validReading) else { return nil }
         return speeds.map { String(Int($0.rounded())) }.joined(separator: "/")
