@@ -578,6 +578,15 @@ enum FanControlPolicy {
     ) -> Bool {
         recoveryNeeded && !(keepAwakeActive && clamshellActive)
     }
+
+    static func shouldRefreshAfterWorkspaceWake(
+        isCooling: Bool,
+        recoveryNeeded: Bool,
+        keepAwakeActive: Bool,
+        clamshellActive: Bool
+    ) -> Bool {
+        isCooling && recoveryNeeded && keepAwakeActive && clamshellActive
+    }
 }
 
 enum SMCValueCodec {

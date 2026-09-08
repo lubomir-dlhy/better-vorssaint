@@ -9962,6 +9962,25 @@ struct MetricsTests {
                     clamshellActive: false
                 ),
                "closed-lid Keep Awake sessions retain fan control across false sleep notifications")
+        expect(FanControlPolicy.shouldRefreshAfterWorkspaceWake(
+                    isCooling: true,
+                    recoveryNeeded: true,
+                    keepAwakeActive: true,
+                    clamshellActive: true
+                )
+                && !FanControlPolicy.shouldRefreshAfterWorkspaceWake(
+                    isCooling: false,
+                    recoveryNeeded: true,
+                    keepAwakeActive: true,
+                    clamshellActive: true
+                )
+                && !FanControlPolicy.shouldRefreshAfterWorkspaceWake(
+                    isCooling: true,
+                    recoveryNeeded: true,
+                    keepAwakeActive: false,
+                    clamshellActive: true
+                ),
+               "a retained closed-lid fan session refreshes its SMC connection after wake")
 
         for language in AppLanguage.allCases {
             let strings = FeatureStrings.fanControl(language)

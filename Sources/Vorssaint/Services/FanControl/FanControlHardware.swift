@@ -43,7 +43,7 @@ final class FanControlHardware {
         let hardware: [SMCClient.Key]
     }
 
-    private let client: SMCClient
+    private var client: SMCClient
     private var controlledFans: [Fan]?
     private var telemetryFans: [TelemetryFan]?
     private var cachedForceTestKey: SMCClient.Key?
@@ -56,6 +56,22 @@ final class FanControlHardware {
     init?() {
         guard let client = SMCClient() else { return nil }
         self.client = client
+    }
+
+    /// AppleSMC can leave an existing user-client connection answering with
+    /// stale, but otherwise valid-looking, sensor values after display sleep
+    /// or a closed-lid session. Reopen the connection and discard every key
+    /// handle derived from it before the controller samples or writes again.
+    func reopenAfterWake() -> Bool {
+        guard let refreshedClient = SMCClient() else { return false }
+        client = refreshedClient
+        controlledFans = nil
+        telemetryFans = nil
+        cachedForceTestKey = nil
+        didDiscoverForceTestKey = false
+        temperatureKeys = nil
+        activeTargets.removeAll()
+        return true
     }
 
     func readOnlySnapshot() throws -> FanControlSnapshot {

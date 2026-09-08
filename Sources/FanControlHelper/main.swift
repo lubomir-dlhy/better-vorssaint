@@ -166,6 +166,64 @@ private final class FanControlController {
         }
     }
 
+    func refreshAfterWake(session id: UUID, reply: @escaping (Data) -> Void) {
+        queue.async {
+            guard self.isCooling else {
+                reply(FanControlIPC.encode(self.statusResponse()))
+                return
+            }
+            guard self.owner == id else {
+                reply(FanControlIPC.encode(.failure(.alreadyControlled,
+                                                    snapshot: self.currentSnapshot())))
+                return
+            }
+            guard let configuration = self.activeConfiguration,
+                  let hardware = self.hardware,
+                  hardware.reopenAfterWake() else {
+                reply(FanControlIPC.encode(self.wakeRefreshFailure(reason: .hardwareChanged)))
+                return
+            }
+
+            // Re-arm the whole session against the fresh AppleSMC connection.
+            // Returning to automatic first makes this safe whether firmware
+            // preserved or reset direct fan mode while the lid was closed.
+            guard hardware.restoreAutomatic() else {
+                reply(FanControlIPC.encode(self.wakeRefreshFailure(reason: .hardwareChanged)))
+                return
+            }
+            do {
+                var refreshedRequest: FanControlCoolingRequest?
+                for attempt in 0..<6 {
+                    refreshedRequest = try? hardware.coolingRequest(for: configuration)
+                    if refreshedRequest != nil { break }
+                    if attempt < 5 { Thread.sleep(forTimeInterval: 0.35) }
+                }
+                guard let request = refreshedRequest else {
+                    reply(FanControlIPC.encode(
+                        self.wakeRefreshFailure(reason: .temperatureUnavailable)
+                    ))
+                    return
+                }
+                _ = try hardware.startCooling(request)
+                self.coolingLevel = request.level
+                self.verificationFailures = 0
+                self.temperatureFailures = 0
+                self.lastHeartbeatUptime = ProcessInfo.processInfo.systemUptime
+                self.lastStopReason = nil
+                log.notice("Cooling session refreshed after wake")
+                reply(FanControlIPC.encode(.success(self.currentSnapshot())))
+            } catch {
+                reply(FanControlIPC.encode(self.wakeRefreshFailure(reason: .hardwareChanged)))
+            }
+        }
+    }
+
+    private func wakeRefreshFailure(reason: FanControlStopReason) -> FanControlResponse {
+        performRestore(reason: reason)
+            ? .success(currentSnapshot())
+            : .failure(.controlFailed, snapshot: currentSnapshot())
+    }
+
     func restore(reply: @escaping (Data) -> Void) {
         queue.async {
             let succeeded = self.performRestore(reason: nil)
@@ -528,6 +586,10 @@ private final class FanControlSession: NSObject, FanControlXPCProtocol {
 
     func heartbeat(withReply reply: @escaping (Data) -> Void) {
         controller.heartbeat(session: id, reply: reply)
+    }
+
+    func refreshAfterWake(withReply reply: @escaping (Data) -> Void) {
+        controller.refreshAfterWake(session: id, reply: reply)
     }
 
     func restoreAutomatic(withReply reply: @escaping (Data) -> Void) {

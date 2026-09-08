@@ -26,6 +26,7 @@ enum FanControlIdentifiers {
     func startMaximumCooling(withReply reply: @escaping (Data) -> Void)
     func applyConfiguration(_ configuration: Data, withReply reply: @escaping (Data) -> Void)
     func heartbeat(withReply reply: @escaping (Data) -> Void)
+    func refreshAfterWake(withReply reply: @escaping (Data) -> Void)
     func restoreAutomatic(withReply reply: @escaping (Data) -> Void)
 }
 

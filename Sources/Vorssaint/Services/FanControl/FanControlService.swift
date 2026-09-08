@@ -31,6 +31,7 @@ final class FanControlService: ObservableObject {
     private var tickCount = 0
     private var processActivity: NSObjectProtocol?
     private var observingWorkspace = false
+    private var wakeRefreshWorkItem: DispatchWorkItem?
 
     private static var appService: SMAppService {
         SMAppService.daemon(plistName: FanControlIdentifiers.plistName)
@@ -47,6 +48,7 @@ final class FanControlService: ObservableObject {
     }
 
     deinit {
+        wakeRefreshWorkItem?.cancel()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         connection?.invalidate()
         timer?.invalidate()
@@ -364,6 +366,42 @@ final class FanControlService: ObservableObject {
         }
     }
 
+    private func refreshCoolingAfterWake() {
+        guard snapshot.isCooling else {
+            if panelIsVisible { refresh() }
+            return
+        }
+        guard !requestInFlight, !isWorking else {
+            scheduleWakeRefresh(after: 1)
+            return
+        }
+        let generation = beginRequest()
+        isWorking = true
+        send { proxy, reply in
+            proxy.refreshAfterWake(withReply: reply)
+        } completion: { response in
+            guard self.finishRequest(generation) else { return }
+            self.isWorking = false
+            guard let response else {
+                self.error = .helperUnavailable
+                self.invalidateTelemetry()
+                self.restoreAutomatic()
+                return
+            }
+            self.apply(response)
+            if response.succeeded, response.snapshot.isCooling {
+                self.startTimerIfNeeded()
+            } else if response.succeeded, !response.snapshot.isCooling {
+                UserDefaults.standard.removeObject(
+                    forKey: DefaultsKey.fanControlRecoveryNeeded
+                )
+                self.stopIdleWorkIfPossible()
+            } else {
+                self.startTimerIfNeeded()
+            }
+        }
+    }
+
     private func apply(_ response: FanControlResponse) {
         snapshot = response.snapshot
         error = response.error
@@ -547,11 +585,15 @@ final class FanControlService: ObservableObject {
                            name: NSWorkspace.willSleepNotification, object: nil)
         center.addObserver(self, selector: #selector(workspaceDidWake),
                            name: NSWorkspace.didWakeNotification, object: nil)
+        center.addObserver(self, selector: #selector(workspaceScreensDidWake),
+                           name: NSWorkspace.screensDidWakeNotification, object: nil)
         observingWorkspace = true
     }
 
     private func stopObservingSystemState() {
         guard observingWorkspace else { return }
+        wakeRefreshWorkItem?.cancel()
+        wakeRefreshWorkItem = nil
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         observingWorkspace = false
     }
@@ -571,16 +613,42 @@ final class FanControlService: ObservableObject {
 
     @objc private func workspaceDidWake() {
         let keepAwake = KeepAwakeManager.shared
+        let recoveryNeeded = UserDefaults.standard.bool(
+            forKey: DefaultsKey.fanControlRecoveryNeeded
+        )
         if FanControlPolicy.shouldRestoreForWorkspaceSleep(
-            recoveryNeeded: UserDefaults.standard.bool(
-                forKey: DefaultsKey.fanControlRecoveryNeeded
-            ),
+            recoveryNeeded: recoveryNeeded,
             keepAwakeActive: keepAwake.isActive,
             clamshellActive: keepAwake.clamshellActive
         ) {
             restoreAutomatic(supersedingCurrentRequest: true)
+        } else if FanControlPolicy.shouldRefreshAfterWorkspaceWake(
+            isCooling: snapshot.isCooling,
+            recoveryNeeded: recoveryNeeded,
+            keepAwakeActive: keepAwake.isActive,
+            clamshellActive: keepAwake.clamshellActive
+        ) {
+            scheduleWakeRefresh()
         } else if panelIsVisible {
             refresh()
         }
+    }
+
+    @objc private func workspaceScreensDidWake() {
+        scheduleWakeRefresh()
+    }
+
+    /// Lid-open and workspace-wake notifications often arrive as a pair. Wait
+    /// briefly for AppleSMC to finish resuming and collapse them into one
+    /// verified helper refresh.
+    private func scheduleWakeRefresh(after delay: TimeInterval = 0.75) {
+        wakeRefreshWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.wakeRefreshWorkItem = nil
+            self.refreshCoolingAfterWake()
+        }
+        wakeRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 }
