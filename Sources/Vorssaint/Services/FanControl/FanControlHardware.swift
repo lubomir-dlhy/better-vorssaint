@@ -309,8 +309,21 @@ final class FanControlHardware {
         return verifyCooling(fans, targets: activeTargets)
             && FanControlPolicy.controlledFansAreSpinning(
                 expectedCount: fans.count,
-                readings: fans.map { client.readValue($0.actual) }
+                readings: fans.map { stableRunningSpeed(for: $0.actual) }
             )
+    }
+
+    /// Apple-silicon SMC occasionally returns a single zero tachometer sample
+    /// immediately after another key read even while the fan is spinning.
+    /// Require three local misses before the outer three-tick watchdog counts
+    /// this as one failed verification.
+    private func stableRunningSpeed(for key: SMCClient.Key) -> Double? {
+        for attempt in 0..<3 {
+            if let speed = client.readValue(key), FanControlPolicy.validReading(speed),
+               speed > 0 { return speed }
+            if attempt < 2 { Thread.sleep(forTimeInterval: 0.05) }
+        }
+        return nil
     }
 
     func readTemperatures() -> [FanControlTemperatureReading] {
