@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Vorssaint
 
+import AppKit
 import CoreGraphics
 import Foundation
 
@@ -38,6 +39,10 @@ enum StatusItemAnchorSupport {
     /// How far down from the top of a screen a status item's window can sit and
     /// still describe a menu bar. Clears the taller bar drawn around a camera
     /// housing with room to spare, while staying far from any ordinary window.
+    /// Measured off the screen's own top edge, never off the area left over
+    /// after the bar: a fullscreen screen reserves nothing, and a band derived
+    /// from the visible area would collapse there and reject a status item
+    /// revealed on hover exactly while it is on screen and clickable.
     static let menuBarBand: CGFloat = 48
 
     /// Breathing room kept between the panel and the edges of the usable area.
@@ -49,13 +54,43 @@ enum StatusItemAnchorSupport {
     /// through it collapses into a screen corner. A frame only counts when it
     /// has real size and its middle sits in the bar band of an attached screen.
     static func isTrustworthyStatusFrame(_ frame: CGRect,
-                                         screenFrames: [CGRect],
+                                         screenFrames: [CGRect] = NSScreen.screens.map(\.frame),
                                          band: CGFloat = menuBarBand) -> Bool {
         guard frame.width > 0, frame.height > 0 else { return false }
         return screenFrames.contains { screen in
             guard screen.intersects(frame) else { return false }
             return frame.midY <= screen.maxY && frame.midY >= screen.maxY - band
         }
+    }
+
+    /// A freshly created status item is born with a zero-height window and
+    /// only settles into the menu bar a moment later (issue #1394). Treating
+    /// that birth frame as "hidden" makes recovery race macOS placement.
+    static func isSettlingStatusFrame(_ frame: CGRect?) -> Bool {
+        guard let frame else { return true }
+        if frame.width <= 0, frame.height <= 0 { return true }
+        return frame.width > 0 && frame.height <= 0
+    }
+
+    /// Bound recovery even if the system immediately closes the panel again.
+    static let panelReopenCooldown: TimeInterval = 1
+
+    /// currentEvent can outlive its dispatch. Only a fresh click delivered to
+    /// this panel permits recovery; keys, other windows and old events do not.
+    static func shouldReopenPanel(closedByApp: Bool,
+                                  lastFrame: CGRect?,
+                                  panelWindowNumber: Int?,
+                                  event: NSEvent?,
+                                  secondsSinceLastReopen: TimeInterval,
+                                  uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        guard !closedByApp,
+              secondsSinceLastReopen > panelReopenCooldown,
+              let lastFrame, let panelWindowNumber, panelWindowNumber > 0,
+              let event, event.windowNumber == panelWindowNumber,
+              event.type == .leftMouseDown || event.type == .leftMouseUp
+                || event.type == .rightMouseDown || event.type == .rightMouseUp,
+              (0...0.25).contains(uptime - event.timestamp) else { return false }
+        return CGRect(origin: .zero, size: lastFrame.size).contains(event.locationInWindow)
     }
 
     /// Where an open panel belongs for a cached anchor: centered on the

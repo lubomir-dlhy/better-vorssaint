@@ -15,9 +15,29 @@ enum CleanerSupport {
     /// What the cleaner can find, in display order. New cases append at the
     /// end: the raw value is a stable identity.
     enum Category: Int, CaseIterable, Identifiable {
-        case leftovers, loginItems, caches, logs, developer, trash, deviceBackups
+        case leftovers, loginItems, caches, logs, developer, trash, deviceBackups, screenshots
 
         var id: Int { rawValue }
+    }
+
+    /// Cancellation for one scan. The main thread cancels it; the scan's
+    /// background loop reads it between categories and stops early instead
+    /// of walking every location for a result nobody is waiting for.
+    final class ScanCancellation {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
     }
 
     /// Cross product infrastructure that ships embedded in other vendors'
@@ -49,12 +69,12 @@ enum CleanerSupport {
     }
 
     /// Whether a Library entry name is shaped like a reverse DNS bundle
-    /// identifier (at least three dot separated components of plain
+    /// identifier (at least two dot separated components of plain
     /// identifier characters). Anything else, including a plain vendor folder,
     /// is never matched by name because it is too easy to hit living app data.
     static func looksLikeBundleID(_ name: String) -> Bool {
         let parts = name.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count >= 3 else { return false }
+        guard parts.count >= 2 else { return false }
         for part in parts {
             guard !part.isEmpty else { return false }
             for scalar in part.unicodeScalars {
@@ -66,23 +86,76 @@ enum CleanerSupport {
         return true
     }
 
+    /// Apple team identifiers are ten uppercase letters and digits. Used to
+    /// drop a leading team prefix so a group container names the app, not
+    /// the developer account.
+    static func isTeamIdentifier(_ raw: String) -> Bool {
+        let value = raw.uppercased()
+        guard raw == value, value.count == 10 else { return false }
+        return value.unicodeScalars.allSatisfy {
+            ($0 >= "A" && $0 <= "Z") || ($0 >= "0" && $0 <= "9")
+        }
+    }
+
     /// Extracts the owning bundle identifier from a Library entry name:
-    /// strips the well known wrappers (group. prefix) and payload suffixes
-    /// (.plist, .savedState, .binarycookies) and validates the shape.
+    /// strips the well known wrappers (group. prefix, a leading team ID)
+    /// and payload suffixes (.plist, .savedState, .binarycookies, preference
+    /// panes, plugins, a trailing ByHost UUID) and validates the shape.
     /// Returns nil when the name does not clearly belong to one bundle.
     static func bundleIDCandidate(fromEntryName rawName: String) -> String? {
-        // A UUID anywhere in the name (per host preferences, update stamps)
-        // makes the owner unattributable; such entries are never candidates.
-        guard !containsUUIDComponent(rawName) else { return nil }
         var name = rawName
-        for suffix in [".plist", ".savedState", ".binarycookies"] where name.hasSuffix(suffix) {
+        for suffix in [".plist", ".savedState", ".binarycookies", ".prefPane",
+                       ".qlgenerator", ".mdimporter", ".service", ".appex",
+                       ".plugin", ".webplugin", ".saver", ".colorPicker",
+                       ".wdgt", ".app", ".framework", ".component", ".vst",
+                       ".vst3", ".clap", ".dpm", ".aaxplugin", ".dictionary",
+                       ".safariextz", ".mailbundle"] where
+            name.lowercased().hasSuffix(suffix.lowercased()) {
             name.removeLast(suffix.count)
         }
+        name = strippingTrailingUUIDComponent(name)
         for prefix in ["group.", "systemgroup."] where name.hasPrefix(prefix) {
             name.removeFirst(prefix.count)
         }
-        guard looksLikeBundleID(name) else { return nil }
+        let parts = name.split(separator: ".")
+        if parts.count >= 3, isTeamIdentifier(String(parts[0])) {
+            name = parts.dropFirst().joined(separator: ".")
+        }
+        // A UUID still in the remainder (update stamps, mid-name hosts)
+        // makes the owner unattributable.
+        guard !containsUUIDComponent(name) else { return nil }
+        guard looksLikeBundleID(name),
+              name.split(separator: ".").allSatisfy({ part in
+                  part.unicodeScalars.contains {
+                      ($0 >= "a" && $0 <= "z") || ($0 >= "A" && $0 <= "Z")
+                  }
+              }) else { return nil }
         return name
+    }
+
+    static func isDirectChild(_ url: URL, of root: URL) -> Bool {
+        url.standardizedFileURL.deletingLastPathComponent().path
+            == root.standardizedFileURL.path
+    }
+
+    /// Last path component of a ByHost preference: the Mac's UUID, not the
+    /// owner. Dropped only when it is the whole trailing component.
+    static func strippingTrailingUUIDComponent(_ name: String) -> String {
+        guard let lastDot = name.lastIndex(of: ".") else { return name }
+        let last = String(name[name.index(after: lastDot)...])
+        guard last.count == 36, containsUUIDComponent(last) else { return name }
+        return String(name[..<lastDot])
+    }
+
+    /// Shared-container wrappers need signed entitlement evidence. The
+    /// general Cleaner has no selected signature, so it leaves them alone.
+    static func hasSharedContainerWrapper(_ rawName: String) -> Bool {
+        let lowered = rawName.lowercased()
+        if lowered.hasPrefix("group.") || lowered.hasPrefix("systemgroup.") {
+            return true
+        }
+        guard let first = rawName.split(separator: ".").first else { return false }
+        return isTeamIdentifier(String(first))
     }
 
     /// Whether the name carries a dashed UUID (8-4-4-4-12 hex groups).
@@ -184,4 +257,72 @@ enum CleanerSupport {
         guard !executables.isEmpty else { return false }
         return !executables.contains(where: executableExists)
     }
+
+    // MARK: - Forgotten screenshots
+
+    /// Written by macOS on every capture it saves (a binary property list
+    /// holding true). A file proves it is a screenshot with this, so nothing
+    /// is ever guessed from a name, and a random image beside it never counts.
+    static let screenCaptureAttribute = "com.apple.metadata:kMDItemIsScreenCapture"
+
+    /// Where macOS keeps a file's last opened date (the Spotlight
+    /// kMDItemLastUsedDate): a timespec, seconds then nanoseconds.
+    static let lastUsedDateAttribute = "com.apple.lastuseddate#PS"
+
+    /// The folder macOS saves screenshots to: the location picked in the
+    /// Screenshot app, which may start with a tilde, or the Desktop when it
+    /// was never changed.
+    static func screenshotFolder(location: String?, home: String) -> String {
+        let trimmed = location?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return home + "/Desktop" }
+        if trimmed == "~" { return home }
+        if trimmed.hasPrefix("~/") { return home + trimmed.dropFirst() }
+        guard trimmed.hasPrefix("/") else { return home + "/Desktop" }
+        return trimmed
+    }
+
+    static func isScreenCaptureFlag(_ data: Data) -> Bool {
+        guard let value = try? PropertyListSerialization.propertyList(from: data, format: nil) else {
+            return false
+        }
+        if let flag = value as? Bool { return flag }
+        if let number = value as? NSNumber { return number.intValue == 1 }
+        return false
+    }
+
+    static func lastUsedDate(fromAttribute data: Data) -> Date? {
+        guard data.count >= 16 else { return nil }
+        var seconds: Int64 = 0
+        var nanoseconds: Int64 = 0
+        for index in 0..<8 {
+            seconds |= Int64(data[data.startIndex + index]) << (8 * index)
+            nanoseconds |= Int64(data[data.startIndex + 8 + index]) << (8 * index)
+        }
+        guard seconds > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(seconds) + TimeInterval(nanoseconds) / 1e9)
+    }
+
+    /// Whether a capture still carries the name macOS gave it, which always
+    /// holds the capture day. A renamed file is a decision the user made
+    /// about it, so it never counts as forgotten. The check is deliberately
+    /// narrow: a capture saved without a date in its name is simply skipped.
+    static func screenshotKeepsDefaultName(_ name: String, created: Date,
+                                           timeZone: TimeZone = .current) -> Bool {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return name.contains(formatter.string(from: created))
+    }
+
+    /// A capture is forgotten when nothing happened to it for `days`: not
+    /// taken, changed or opened since then.
+    static func isForgottenScreenshot(created: Date, modified: Date?, lastUsed: Date?,
+                                      now: Date, days: Int) -> Bool {
+        guard days > 0 else { return false }
+        let latest = [created, modified, lastUsed].compactMap { $0 }.max() ?? created
+        return now.timeIntervalSince(latest) >= TimeInterval(days) * 86_400
+    }
+
 }

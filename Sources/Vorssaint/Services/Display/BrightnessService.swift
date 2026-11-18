@@ -33,6 +33,8 @@ struct BrightnessDisplay: Identifiable, Equatable {
     /// still works (writes go through), it just starts from the last value
     /// applied here instead of the monitor's own.
     let readable: Bool
+    /// Manual dimming choices need a stable display-and-connection key.
+    var canChooseDimming = false
 }
 
 /// Brightness sliders for every display, built-in and external. The built-in
@@ -41,7 +43,8 @@ struct BrightnessDisplay: Identifiable, Equatable {
 /// buttons use, addressed per display through its I2C service.
 ///
 /// While display control is off there are no display observers, services or
-/// I2C traffic. Keyboard light state is read only when Quick toggles opens.
+/// I2C traffic. Keyboard light state is read when Quick toggles opens or one
+/// of its global shortcuts is pressed.
 /// While display control is on, the standing resources are one screen change
 /// observer and a pair of wake observers, and no timers; everything else
 /// happens when a slider moves, a panel opens or the Mac wakes. All I2C work
@@ -49,6 +52,8 @@ struct BrightnessDisplay: Identifiable, Equatable {
 /// coalesce to the newest value per display.
 final class BrightnessService: ObservableObject {
     static let shared = BrightnessService()
+    private static let sharedKeyboardLightBridge = KeyboardLightBridge()
+    static var keyboardLightIsSupported: Bool { sharedKeyboardLightBridge != nil }
 
     /// Field diagnosis channel: external display trouble is invisible from
     /// here (issue #301 kind of reports), so the display pipeline narrates
@@ -58,15 +63,32 @@ final class BrightnessService: ObservableObject {
                                     category: "display")
 
     @Published private(set) var displays: [BrightnessDisplay] = []
+    /// The displays that currently put a picture in front of a person, as the
+    /// last rebuild found them. The panel decides from this snapshot instead
+    /// of asking the display server itself: `canToggleDisplay` is read from a
+    /// SwiftUI body, and a body is laid out again from inside the display
+    /// reconfiguration this app drives on the main thread, where a question
+    /// for the display server is one the same thread is already busy
+    /// answering (issue #969).
+    @Published private(set) var drawableDisplays = Set<CGDirectDisplayID>()
     @Published private(set) var pendingDisplayIDs = Set<CGDirectDisplayID>()
+    /// Displays a person has told this app to dim in software. A channel that
+    /// accepts writes and answers no reads is indistinguishable on the bus
+    /// from one that swallows them, so the only witness is someone watching
+    /// the panel (issue #1589).
+    @Published private(set) var softwareDimmingPreferred = Set<CGDirectDisplayID>()
+    @Published private(set) var extendedDimmingPreferred = Set<CGDirectDisplayID>()
     @Published private(set) var displayControlFailure: DisplayControlFailure?
     @Published private(set) var brightnessOSDSupported = false
     @Published private(set) var keyboardLightEnabled: Bool?
+    @Published private(set) var displayBrightnessShortcutRegistrationFailed = false
+    @Published private(set) var keyboardBrightnessShortcutRegistrationFailed = false
 
     enum DisplayControlFailure: Equatable {
         case unavailable
         case lastActive
         case failed
+        case closedLid
     }
 
     private struct Route {
@@ -75,8 +97,13 @@ final class BrightnessService: ObservableObject {
         var maximum: UInt16
         var ddcReadable = false
         var ddcPathKey: String?
+        var extendedDimming = false
+        var lastDDCValue: UInt16?
     }
 
+    private var deferredRestoration = BrightnessSupport.DeferredDisplayRestoration()
+    private var lidNotificationPort: IONotificationPortRef?
+    private var lidNotification: io_object_t = 0
     private var screenObserver: NSObjectProtocol?
     private var rebuildDebounce: DispatchWorkItem?
     private var wakeObservers: [NSObjectProtocol] = []
@@ -108,6 +135,10 @@ final class BrightnessService: ObservableObject {
     /// Whether the app's own overlay stands in for the system's, sampled with
     /// the tap so the tap thread never reads published state.
     private var overlayReplacesNativeOSD = false
+    /// Where a plain key press lands, sampled the same way: the display under
+    /// the pointer, or the one the system's own keys move.
+    private var functionKeysFollowPointer = false
+    private var functionKeySystemTarget: CGDirectDisplayID?
     /// Codes whose press this app consumed, so the matching release is
     /// consumed as well and the system never sees half a key.
     private var swallowedKeyCodes = Set<Int>()
@@ -200,19 +231,53 @@ final class BrightnessService: ObservableObject {
     /// last row so the panel still offers the button that brings it back.
     private var managedDisabledDisplays: [CGDirectDisplayID: BrightnessDisplay] = [:]
     private var running = false
-    private var keyboardLightLevel: Float?
+    /// Permission reset removes only the two Accessibility event taps. The
+    /// display routes, disabled-display journal and gamma state stay live so
+    /// revoking permission cannot undo a user's current brightness setup.
+    private var inputTapsSuspended = false
+    private func tapsAreSuspended() -> Bool {
+        keyThreadLock.withLock { inputTapsSuspended }
+    }
+    @Published private(set) var keyboardLightLevel: Float?
+    private var keyboardNoticeWork: DispatchWorkItem?
+    /// A drag folds into one write of its newest value, like the display
+    /// sliders. Non-nil means a write is already scheduled.
+    private var keyboardLevelWork: DispatchWorkItem?
+    /// Set between the slider's begin and end events. Holds the level the
+    /// light was at before the drag, which is what the switch brings back
+    /// when the drag ends at 0 (nil inside when it started off).
+    private var keyboardDragStart: Float??
     private var lastKeyboardLightLevel: Float = BrightnessSupport.defaultKeyboardLightLevel
-    private lazy var keyboardLightBridge = KeyboardLightBridge()
+    private var keyboardLightBridge: KeyboardLightBridge? { Self.sharedKeyboardLightBridge }
+    private let displayBrightnessDecreaseHotkey = QuickToolHotkey(id: 59)
+    private let displayBrightnessIncreaseHotkey = QuickToolHotkey(id: 60)
+    private let keyboardBrightnessDecreaseHotkey = QuickToolHotkey(id: 57)
+    private let keyboardBrightnessIncreaseHotkey = QuickToolHotkey(id: 58)
     /// Stale rebuilds (an unplug mid-scan) must not overwrite fresh state.
     private var rebuildGeneration = 0
     /// The topology a queued or running rebuild already covers. Opening the
     /// panel must not put the same slow monitor probe behind itself again.
     private var rebuildingTopology: BrightnessSupport.DisplayTopology?
 
-    private init() {}
+    private init() {
+        SessionActivity.shared.onChange { [weak self] _ in self?.syncKeyTap() }
+        displayBrightnessDecreaseHotkey.onPress = { [weak self] in
+            self?.stepDisplayBrightness(delta: -BrightnessSupport.brightnessKeyStep)
+        }
+        displayBrightnessIncreaseHotkey.onPress = { [weak self] in
+            self?.stepDisplayBrightness(delta: BrightnessSupport.brightnessKeyStep)
+        }
+        keyboardBrightnessDecreaseHotkey.onPress = { [weak self] in
+            self?.stepKeyboardLight(direction: -1)
+        }
+        keyboardBrightnessIncreaseHotkey.onPress = { [weak self] in
+            self?.stepKeyboardLight(direction: 1)
+        }
+    }
 
     func setKeyboardLightEnabled(_ enabled: Bool) {
         guard keyboardLightEnabled != nil, let keyboardLightBridge else { return }
+        finishKeyboardLightDrag()
         if !enabled, let level = keyboardLightLevel, level > 0 {
             lastKeyboardLightLevel = level
         }
@@ -225,10 +290,74 @@ final class BrightnessService: ObservableObject {
         }
         keyboardLightLevel = target
         keyboardLightEnabled = target > 0
+        showKeyboardLightNotice(target)
     }
 
-    /// Reads this Mac's keyboard light only when its Quick toggles surface opens.
+    /// Writes an absolute level, for the sliders in the panel and in Settings.
+    /// The published value moves on the spot for a responsive slider; the
+    /// write is folded so a drag reaches the keyboard once, with its newest
+    /// value. The Quick toggles switch keeps to `setKeyboardLightEnabled`,
+    /// which restores the last level rather than naming one.
+    func setKeyboardLightLevel(_ level: Float) {
+        guard keyboardLightEnabled != nil,
+              let target = BrightnessSupport.sliderKeyboardLightLevel(level)
+        else { return }
+        keyboardLightLevel = target
+        keyboardLightEnabled = target > 0
+        // A step with no drag around it (VoiceOver, arrow keys) settles now.
+        if keyboardDragStart == nil, target > 0 { lastKeyboardLightLevel = target }
+        guard keyboardLevelWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.keyboardLevelWork = nil
+            self.commitKeyboardLightLevel()
+        }
+        keyboardLevelWork = work
+        // One frame of folding; a real throttle if a drag ever outruns the
+        // private setter by more than this.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0, execute: work)
+    }
+
+    private func commitKeyboardLightLevel() {
+        guard let target = keyboardLightLevel, let keyboardLightBridge else { return }
+        guard keyboardLightBridge.setBrightness(target) else {
+            refreshKeyboardLight()
+            return
+        }
+        showKeyboardLightNotice(target)
+    }
+
+    /// The slider's own begin and end events bracket a drag. A pause while
+    /// still holding it is not an end.
+    func keyboardLightDragChanged(_ editing: Bool) {
+        if editing {
+            finishKeyboardLightDrag()
+            let current = keyboardLightLevel
+            keyboardDragStart = .some(current.flatMap { $0 > 0 ? $0 : nil })
+        } else {
+            finishKeyboardLightDrag()
+        }
+    }
+
+    /// Settles the level the switch brings back: where the drag left it, or,
+    /// if it went all the way off, the level held before the drag rather than
+    /// whatever it passed on the way down. Anything else that takes over the
+    /// light (the switch, a key step) calls this first.
+    private func finishKeyboardLightDrag() {
+        guard let start = keyboardDragStart else { return }
+        keyboardDragStart = nil
+        if let level = keyboardLightLevel, level > 0 {
+            lastKeyboardLightLevel = level
+        } else if let start {
+            lastKeyboardLightLevel = start
+        }
+    }
+
+    /// Reads this Mac's keyboard light when a surface that shows it opens.
     func refreshKeyboardLight() {
+        // A read landing mid-drag would show the level the keyboard is still
+        // catching up to, so the slider keeps its own value until the write lands.
+        guard keyboardLevelWork == nil else { return }
         guard let level = keyboardLightBridge?.brightness(), level >= 0, level <= 1 else {
             keyboardLightLevel = nil
             keyboardLightEnabled = nil
@@ -239,11 +368,123 @@ final class BrightnessService: ObservableObject {
         keyboardLightEnabled = level > 0
     }
 
+    func stepKeyboardLight(direction: Int) {
+        guard AppFeature.brightness.isAvailable,
+              UserDefaults.standard.bool(forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled),
+              direction != 0,
+              let keyboardLightBridge,
+              let current = keyboardLightLevel(using: keyboardLightBridge)
+        else { return }
+        finishKeyboardLightDrag()
+        let target = BrightnessSupport.steppedKeyboardLightLevel(
+            current: current, direction: direction)
+        guard keyboardLightBridge.setBrightness(target) else {
+            refreshKeyboardLight()
+            return
+        }
+        keyboardLightLevel = target
+        if target > 0 { lastKeyboardLightLevel = target }
+        keyboardLightEnabled = target > 0
+        showKeyboardLightNotice(target)
+    }
+
+    private func showKeyboardLightNotice(_ level: Float) {
+        guard NotchSupport.routes(.keyboardLight), SessionActivity.shared.isActive,
+              level.isFinite, (0...1).contains(level) else { return }
+        NotchService.shared.showKeyboardLight(Double(level))
+    }
+
+    /// Observe native keys without consuming them. A bounded, coalesced read
+    /// follows the system's own adjustment and never predicts a percentage.
+    private func scheduleKeyboardLightNotice() {
+        guard keyboardNoticeWork == nil, NotchSupport.routes(.keyboardLight),
+              SessionActivity.shared.isActive, keyboardLightBridge != nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.keyboardNoticeWork = nil
+            guard NotchSupport.routes(.keyboardLight), SessionActivity.shared.isActive else { return }
+            self.refreshKeyboardLight()
+            if let level = self.keyboardLightLevel { self.showKeyboardLightNotice(level) }
+        }
+        keyboardNoticeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+    }
+
+    /// Read at the press, not from the last value this app wrote. Control
+    /// Center and ambient-light changes can move the backlight between two
+    /// shortcut presses.
+    private func keyboardLightLevel(using bridge: KeyboardLightBridge) -> Float? {
+        let level = bridge.brightness()
+        guard level >= 0, level <= 1 else {
+            keyboardLightEnabled = nil
+            return nil
+        }
+        return level
+    }
+
     func syncWithPreferences() {
         let wanted = AppFeature.brightness.isAvailable
             && UserDefaults.standard.bool(forKey: DefaultsKey.brightnessControlEnabled)
-        if wanted { start() } else { stop() }
+        if wanted { start() } else if running { stop() }
         syncKeyTap()
+        syncKeyboardBrightnessHotkeys()
+        syncDisplayBrightnessHotkeys()
+    }
+
+    private func syncDisplayBrightnessHotkeys() {
+        let enabled = running && AppFeature.brightness.isAvailable
+            && UserDefaults.standard.bool(forKey: DefaultsKey.displayBrightnessShortcutsEnabled)
+        let decrease = GlobalShortcutRole.displayBrightnessDecrease.savedShortcut
+        let increase = GlobalShortcutRole.displayBrightnessIncrease.savedShortcut
+        let decreaseConflicts = enabled && decrease.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(GlobalShortcutRole.displayBrightnessDecrease.storageKey)
+        let increaseConflicts = enabled && increase.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(GlobalShortcutRole.displayBrightnessIncrease.storageKey)
+        let decreaseRegistered = displayBrightnessDecreaseHotkey.sync(
+            enabled: enabled && !decreaseConflicts, shortcut: decrease,
+            storageKey: GlobalShortcutRole.displayBrightnessDecrease.storageKey)
+        let increaseRegistered = displayBrightnessIncreaseHotkey.sync(
+            enabled: enabled && !increaseConflicts, shortcut: increase,
+            storageKey: GlobalShortcutRole.displayBrightnessIncrease.storageKey)
+        displayBrightnessShortcutRegistrationFailed = decreaseConflicts || increaseConflicts
+            || !(decreaseRegistered && increaseRegistered)
+    }
+
+    private func stepDisplayBrightness(delta: Double) {
+        guard running, AppFeature.brightness.isAvailable, SessionActivity.shared.isActive,
+              UserDefaults.standard.bool(forKey: DefaultsKey.displayBrightnessShortcutsEnabled)
+        else { return }
+        let pointer = NSEvent.mouseLocation
+        let pointerDisplay = NSScreen.screens.first { NSMouseInRect(pointer, $0.frame, false) }
+            .flatMap { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value }
+        let eligible = Set(displays.filter { $0.isActive && $0.method != nil
+            && !pendingDisplayIDs.contains($0.id) }.map(\.id))
+        guard let id = BrightnessSupport.shortcutDisplay(
+            followsPointer: UserDefaults.standard.bool(forKey: DefaultsKey.brightnessKeysEnabled),
+            pointerDisplay: pointerDisplay, primaryDisplay: CGMainDisplayID(), eligible: eligible),
+              let method = displays.first(where: { $0.id == id })?.method else { return }
+        step(id, method: method, delta: delta,
+             showOSD: UserDefaults.standard.bool(forKey: DefaultsKey.brightnessOSDEnabled))
+    }
+
+    private func syncKeyboardBrightnessHotkeys() {
+        let enabled = AppFeature.brightness.isAvailable
+            && UserDefaults.standard.bool(forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled)
+            && keyboardLightBridge != nil
+        let decreaseShortcut = GlobalShortcutRole.keyboardBrightnessDecrease.savedShortcut
+        let increaseShortcut = GlobalShortcutRole.keyboardBrightnessIncrease.savedShortcut
+        let decreaseConflicts = enabled && decreaseShortcut.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(GlobalShortcutRole.keyboardBrightnessDecrease.storageKey)
+        let increaseConflicts = enabled && increaseShortcut.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(GlobalShortcutRole.keyboardBrightnessIncrease.storageKey)
+        let decreaseRegistered = keyboardBrightnessDecreaseHotkey.sync(
+            enabled: enabled && !decreaseConflicts, shortcut: decreaseShortcut,
+            storageKey: GlobalShortcutRole.keyboardBrightnessDecrease.storageKey)
+        let increaseRegistered = keyboardBrightnessIncreaseHotkey.sync(
+            enabled: enabled && !increaseConflicts, shortcut: increaseShortcut,
+            storageKey: GlobalShortcutRole.keyboardBrightnessIncrease.storageKey)
+        keyboardBrightnessShortcutRegistrationFailed = decreaseConflicts || increaseConflicts
+            || !(decreaseRegistered && increaseRegistered)
     }
 
     private func start() {
@@ -259,9 +500,18 @@ final class BrightnessService: ObservableObject {
     }
 
     func stop() {
+        // Keep the reset guard intact while preferences or feature state
+        // changes during the asynchronous permission teardown. The reset
+        // owner releases it explicitly through resumeInputTaps().
+        keyboardNoticeWork?.cancel(); keyboardNoticeWork = nil
+        keyboardLevelWork?.cancel(); keyboardLevelWork = nil
+        keyboardDragStart = nil
+        removeKeyTap()
+        displayBrightnessDecreaseHotkey.unregister()
+        displayBrightnessIncreaseHotkey.unregister()
+        displayBrightnessShortcutRegistrationFailed = false
         guard running else { return }
         running = false
-        removeKeyTap()
         removeFunctionKeyTap()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
@@ -285,25 +535,24 @@ final class BrightnessService: ObservableObject {
         brightnessOSDSupported = false
         BrightnessOSD.teardown()
         if !displays.isEmpty { displays = [] }
-        // Restore displays and gamma on the work queue, AFTER any operation
-        // already in flight. Normal app termination uses the synchronous
-        // restoration below; gamma also reverts with the process.
+        if !drawableDisplays.isEmpty { drawableDisplays = [] }
+        // Queue on the work queue first so this lands AFTER any operation
+        // already in flight, then hand the reconfigurations to the main
+        // thread, which is the only place they may run (see
+        // `configureDisplay`), and put the gamma curves back behind them.
+        // Normal app termination uses the synchronous restoration below;
+        // gamma also reverts with the process.
         workQueue.async { [weak self] in
-            guard let self else { return }
-            self.stateLock.lock()
-            let displaysToRestore = self.managedDisabledIDs
-            self.stateLock.unlock()
-            for id in displaysToRestore {
-                guard Self.configureDisplay(id, enabled: true) else { continue }
-                self.stateLock.lock()
-                self.managedDisabledIDs.remove(id)
-                self.managedDisabledDisplays.removeValue(forKey: id)
-                self.stateLock.unlock()
-                Self.forgetDisplaySwitchedOff(id)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.restoreManagedDisplays()
+                self.workQueue.async { [weak self] in
+                    guard let self else { return }
+                    self.restoreAllGamma()
+                    self.ddcCommandEnds = [:]
+                    Self.log.log("brightness service stopped; displays and gamma restored")
+                }
             }
-            self.restoreAllGamma()
-            self.ddcCommandEnds = [:]
-            Self.log.log("brightness service stopped; displays and gamma restored")
         }
     }
 
@@ -325,9 +574,25 @@ final class BrightnessService: ObservableObject {
         let generation = rebuildGeneration
         rebuildingTopology = topology
         stateLock.unlock()
+        let screenNames = Self.localizedScreenNames()
         workQueue.async { [weak self] in
-            self?.rebuild(generation: generation, previousDisplays: previousDisplays)
+            self?.rebuild(generation: generation, previousDisplays: previousDisplays,
+                          screenNames: screenNames)
         }
+    }
+
+    /// The display names a person sees in System Settings, which is what the
+    /// sliders are labelled with. `NSScreen` is main thread only while the
+    /// rebuild runs on `workQueue`, so the whole set is read here and carried
+    /// into the rebuild rather than looked up from it.
+    private static func localizedScreenNames() -> [CGDirectDisplayID: String] {
+        var names: [CGDirectDisplayID: String] = [:]
+        for screen in NSScreen.screens {
+            guard let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+                             as? NSNumber)?.uint32Value else { continue }
+            names[id] = screen.localizedName
+        }
+        return names
     }
 
     /// Moves one display's brightness. The published value updates on the
@@ -335,7 +600,9 @@ final class BrightnessService: ObservableObject {
     /// queue, and a drag folds into one write of the newest value.
     func setBrightness(_ value: Double, for id: CGDirectDisplayID,
                        showOSD: Bool = false) {
+        guard value.isFinite else { return }
         let clamped = min(max(value, 0), 1)
+        let shownInNotch = NotchService.shared.showBrightness(clamped)
         if let index = displays.firstIndex(where: { $0.id == id }),
            displays[index].brightness != clamped {
             displays[index].brightness = clamped
@@ -343,7 +610,7 @@ final class BrightnessService: ObservableObject {
         stateLock.lock()
         writeSequence &+= 1
         pendingLevels[id] = PendingWrite(value: clamped,
-                                         showOSD: showOSD,
+                                         showOSD: showOSD && !shownInNotch,
                                          sequence: writeSequence)
         lastApplied[id] = RememberedLevel(value: clamped,
                                           fingerprint: Self.displayFingerprint(id))
@@ -368,12 +635,8 @@ final class BrightnessService: ObservableObject {
     func canToggleDisplay(_ display: BrightnessDisplay) -> Bool {
         guard displaySwitchingAvailable, !isDisplayPending(display.id) else { return false }
         guard display.isActive else { return true }
-        stateLock.lock()
-        let online = knownTopology
-        let active = knownActiveTopology
-        stateLock.unlock()
-        let drawable = Self.drawableDisplayIDs(online: online, active: active)
-        return BrightnessSupport.canDisableDisplay(drawableDisplayIDs: drawable, target: display.id)
+        return BrightnessSupport.canDisableDisplay(drawableDisplayIDs: drawableDisplays,
+                                                  target: display.id)
     }
 
     /// Enables or disables one connected display without changing the saved
@@ -414,44 +677,75 @@ final class BrightnessService: ObservableObject {
                     return
                 }
                 // A software-dimmed screen should return with its clean gamma
-                // before the saved dim level is reapplied by the rebuild.
-                if let baseline = self.gammaBaselines[display.id] {
+                // before the saved dim level is reapplied by the rebuild. The
+                // number may already belong to another monitor (see `GammaTable`).
+                if let baseline = self.gammaBaselines[display.id],
+                   baseline.fingerprint == Self.displayFingerprint(display.id) {
                     CGSetDisplayTransferByTable(display.id, baseline.count, baseline.red,
                                                 baseline.green, baseline.blue)
                 }
             }
 
-            if !targetEnabled { Self.rememberDisplaySwitchedOff(display.id) }
-            guard Self.configureDisplay(display.id, enabled: targetEnabled) else {
-                if !targetEnabled { Self.forgetDisplaySwitchedOff(display.id) }
-                self.finishDisplayToggle(id: display.id, enabled: targetEnabled,
-                                         failure: .failed)
-                return
+            // The gamma curve above is work-queue state; the reconfiguration
+            // itself belongs to the main thread (see `configureDisplay`).
+            DispatchQueue.main.async { [weak self] in
+                self?.commitDisplayToggle(display, enabled: targetEnabled)
             }
-
-            self.stateLock.lock()
-            self.pendingLevels.removeValue(forKey: display.id)
-            if targetEnabled {
-                self.managedDisabledIDs.remove(display.id)
-                self.managedDisabledDisplays.removeValue(forKey: display.id)
-                self.knownActiveTopology.insert(display.id)
-                Self.forgetDisplaySwitchedOff(display.id)
-            } else {
-                self.managedDisabledIDs.insert(display.id)
-                var disabled = display
-                disabled.method = nil
-                disabled.isActive = false
-                self.managedDisabledDisplays[display.id] = disabled
-                self.knownActiveTopology.remove(display.id)
-            }
-            self.stateLock.unlock()
-            self.finishDisplayToggle(id: display.id, enabled: targetEnabled, failure: nil)
         }
+    }
+
+    /// Second half of `toggleDisplay`, on the main thread: the display
+    /// reconfiguration and the bookkeeping that follows it.
+    private func commitDisplayToggle(_ display: BrightnessDisplay, enabled: Bool) {
+        if !enabled { Self.rememberDisplaySwitchedOff(display.id) }
+        let result = Self.configureDisplay(display.id, enabled: enabled)
+        guard result == .success else {
+            if !enabled { Self.forgetDisplaySwitchedOff(display.id) }
+            if result == .closedLid {
+                // The panel tells the person to open the lid, so opening it
+                // has to finish what the tap asked for.
+                deferredRestoration.keep(display.id)
+                deferredRestoration.record(display.id, result: .closedLid)
+                syncLidObserver()
+            }
+            finishDisplayToggle(id: display.id, enabled: enabled,
+                                failure: result == .closedLid ? .closedLid : .failed)
+            return
+        }
+
+        stateLock.lock()
+        pendingLevels.removeValue(forKey: display.id)
+        if enabled {
+            managedDisabledIDs.remove(display.id)
+            managedDisabledDisplays.removeValue(forKey: display.id)
+            knownActiveTopology.insert(display.id)
+        } else {
+            managedDisabledIDs.insert(display.id)
+            var disabled = display
+            disabled.method = nil
+            disabled.isActive = false
+            managedDisabledDisplays[display.id] = disabled
+            knownActiveTopology.remove(display.id)
+        }
+        stateLock.unlock()
+        // The stored list is written with the lock released, like every other
+        // place that touches it. A `UserDefaults` write posts
+        // `didChangeNotification`, and the observers registered with
+        // `queue: .main` make that post wait for the main thread; held under
+        // `stateLock` it waits on a main thread that is itself waiting for the
+        // same lock inside `canToggleDisplay`, called from a SwiftUI body
+        // (issue #647). Running here on the main thread is what keeps that from
+        // happening today, and the thread this runs on is not something the
+        // lock should have to depend on.
+        deferredRestoration.record(display.id, result: .success)
+        syncLidObserver()
+        if enabled { Self.forgetDisplaySwitchedOff(display.id) }
+        finishDisplayToggle(id: display.id, enabled: enabled, failure: nil)
     }
 
     private func finishDisplayToggle(id: CGDirectDisplayID, enabled: Bool,
                                      failure: DisplayControlFailure?) {
-        DispatchQueue.main.async { [weak self] in
+        let finish = { [weak self] in
             guard let self else { return }
             self.pendingDisplayIDs.remove(id)
             self.displayControlFailure = failure
@@ -461,6 +755,9 @@ final class BrightnessService: ObservableObject {
                 self.refresh()
             }
         }
+        // Publish a main-thread transaction before queued lid recovery can
+        // succeed, otherwise its old failure could overwrite that success.
+        if Thread.isMainThread { finish() } else { DispatchQueue.main.async(execute: finish) }
     }
 
     /// The active list can include virtual devices with no picture a person
@@ -474,16 +771,98 @@ final class BrightnessService: ObservableObject {
             onlineDisplayIDs: online, activeDisplayIDs: active, virtualDisplayIDs: virtual)
     }
 
-    private static func configureDisplay(_ id: CGDirectDisplayID, enabled: Bool) -> Bool {
-        guard let configure = DisplayConfigurationBridge.configureEnabled else { return false }
+    /// Switches one display on or off inside a display reconfiguration
+    /// transaction. **Main thread only.** CoreGraphics runs a
+    /// reconfiguration's callbacks inline on whichever thread drives the
+    /// transaction, and in this process those callbacks are AppKit's: they
+    /// rebuild `NSScreen` and post the screen-parameters notification, which
+    /// is main-thread work. Driven from the work queue they run off the main
+    /// thread while the main thread is itself inside CoreGraphics asking for
+    /// the display list, and neither side can finish, so the app freezes with
+    /// nothing left that can end it (issue #747). A caller on the wrong
+    /// thread is refused and logged rather than allowed to hang.
+    private static func configureDisplay(
+        _ id: CGDirectDisplayID, enabled: Bool
+    ) -> BrightnessSupport.DisplayConfigurationResult {
+        guard Thread.isMainThread else {
+            log.error("refused to reconfigure display \(id) off the main thread")
+            return .failed
+        }
+        guard let configure = DisplayConfigurationBridge.configureEnabled else { return .failed }
+        guard BrightnessSupport.canConfigureDisplay(
+            enabled: enabled, isBuiltIn: CGDisplayIsBuiltin(id) != 0,
+            lidClosed: enabled ? lidClosed() : nil) else { return .closedLid }
         var reference: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&reference) == .success,
-              let configuration = reference else { return false }
+              let configuration = reference else { return .failed }
         guard configure(configuration, id, enabled) == 0 else {
             CGCancelDisplayConfiguration(configuration)
-            return false
+            return .failed
         }
-        return CGCompleteDisplayConfiguration(configuration, .forAppOnly) == .success
+        return CGCompleteDisplayConfiguration(configuration, .forAppOnly) == .success ? .success : .failed
+    }
+
+    static func lidClosed() -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                  IOServiceMatching("IOPMrootDomain"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        return IORegistryEntryCreateCFProperty(service, "AppleClamshellState" as CFString,
+                                              kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool
+    }
+
+    /// These requests outlive the brightness feature, but never the app.
+    private func restoreDisplay(_ id: CGDirectDisplayID) -> BrightnessSupport.DisplayConfigurationResult {
+        let result = Self.configureDisplay(id, enabled: true)
+        deferredRestoration.record(id, result: result)
+        syncLidObserver()
+        if result == .success { displayControlFailure = nil }
+        return result
+    }
+
+    private func syncLidObserver() {
+        if deferredRestoration.ids.isEmpty {
+            if lidNotification != 0 { IOObjectRelease(lidNotification) }
+            lidNotification = 0
+            if let lidNotificationPort { IONotificationPortDestroy(lidNotificationPort) }
+            lidNotificationPort = nil
+            return
+        }
+        guard lidNotificationPort == nil else { return }
+        let root = IOServiceGetMatchingService(kIOMainPortDefault,
+                                               IOServiceMatching("IOPMrootDomain"))
+        guard root != 0 else { return }
+        defer { IOObjectRelease(root) }
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        let result = IOServiceAddInterestNotification(
+            port, root, kIOGeneralInterest, { context, _, _, _ in
+                guard let context else { return }
+                let service = Unmanaged<BrightnessService>.fromOpaque(context).takeUnretainedValue()
+                // Root-domain general interest includes clamshell changes. Read
+                // the current property outside the callback before configuring.
+                DispatchQueue.main.async { [weak service] in service?.restoreDeferredDisplays() }
+            }, Unmanaged.passUnretained(self).toOpaque(), &lidNotification)
+        guard result == KERN_SUCCESS else {
+            IONotificationPortDestroy(port)
+            Self.log.error("could not observe deferred display restoration: \(result)")
+            return
+        }
+        lidNotificationPort = port
+        IONotificationPortSetDispatchQueue(port, DispatchQueue.main)
+        // Subscribe before rechecking: the lid may have opened since denial.
+        DispatchQueue.main.async { [weak self] in self?.restoreDeferredDisplays() }
+    }
+
+    private func restoreDeferredDisplays() {
+        for id in deferredRestoration.candidates(lidClosed: Self.lidClosed()) {
+            guard restoreDisplay(id) == .success else { continue }
+            stateLock.lock()
+            managedDisabledIDs.remove(id)
+            managedDisabledDisplays.removeValue(forKey: id)
+            stateLock.unlock()
+            Self.forgetDisplaySwitchedOff(id)
+            refresh(force: true)
+        }
     }
 
     private static func activeDisplayIDs() -> Set<CGDirectDisplayID> {
@@ -503,34 +882,41 @@ final class BrightnessService: ObservableObject {
             active: activeDisplayIDs())
     }
 
-    /// AppKit gives termination hooks only a brief synchronous window. Queue
-    /// behind any toggle already in flight, then restore every display this
-    /// process disabled before the process exits.
+    /// AppKit gives termination hooks only a brief synchronous window. Put
+    /// every dimmed picture back first, queued behind any operation already in
+    /// flight: leaving one behind is the difference between quitting the app
+    /// and a screen that stays dark with nothing left running to explain it.
+    /// The reconfigurations then run here, on the main thread AppKit calls
+    /// this from, which is where they have to run anyway (see
+    /// `configureDisplay`).
     func restoreDisplaysBeforeTermination() {
-        workQueue.sync {
-            // Put every dimmed picture back before anything else: leaving one
-            // behind is the difference between quitting the app and a screen
-            // that stays dark with nothing left running to explain it.
-            restoreAllGamma()
+        workQueue.sync { restoreAllGamma() }
+        restoreManagedDisplays()
+    }
+
+    /// Switches every display this process disabled back on. Main thread only,
+    /// like every other reconfiguration here.
+    private func restoreManagedDisplays() {
+        stateLock.lock()
+        let ids = managedDisabledIDs
+        stateLock.unlock()
+        for id in ids {
+            deferredRestoration.keep(id)
+            guard restoreDisplay(id) == .success else { continue }
             stateLock.lock()
-            let ids = managedDisabledIDs
+            managedDisabledIDs.remove(id)
+            managedDisabledDisplays.removeValue(forKey: id)
             stateLock.unlock()
-            for id in ids {
-                guard Self.configureDisplay(id, enabled: true) else { continue }
-                stateLock.lock()
-                managedDisabledIDs.remove(id)
-                managedDisabledDisplays.removeValue(forKey: id)
-                stateLock.unlock()
-                Self.forgetDisplaySwitchedOff(id)
-            }
+            Self.forgetDisplaySwitchedOff(id)
         }
     }
 
-    /// Writes every remembered curve back, skipping any display number that
+    /// Restores only curves this app dimmed, skipping any display number that
     /// now belongs to a different monitor. Runs on the work queue.
     private func restoreAllGamma() {
-        for (id, baseline) in gammaBaselines
-        where Self.displayFingerprint(id) == baseline.fingerprint {
+        for id in dimmedDisplays {
+            guard let baseline = gammaBaselines[id],
+                  Self.displayFingerprint(id) == baseline.fingerprint else { continue }
             CGSetDisplayTransferByTable(id, baseline.count, baseline.red,
                                         baseline.green, baseline.blue)
             Self.log.log("restored gamma baseline for display \(id)")
@@ -563,46 +949,65 @@ final class BrightnessService: ObservableObject {
         }
     }
 
-    /// Switches back on anything a previous run left off. Called at startup,
-    /// before any display work, so a screen is never stranded between runs.
+    /// Switches back on anything a previous run left off. Called at startup on
+    /// the main thread, before any display work, so a screen is never stranded
+    /// between runs. Nothing here belongs to the work queue, and the
+    /// reconfiguration itself may not run there (see `configureDisplay`).
     func restoreDisplaysLeftOff() {
         let stored = UserDefaults.standard.array(forKey: DefaultsKey.displaysSwitchedOff) as? [Int] ?? []
         guard !stored.isEmpty else { return }
         guard DisplayConfigurationBridge.configureEnabled != nil else { return }
-        workQueue.async {
-            for id in stored {
-                // The list is plain numbers on disk and can arrive edited or
-                // imported, so anything that is not a display number is
-                // skipped rather than converted.
-                guard let displayID = CGDirectDisplayID(exactly: id) else { continue }
-                guard Self.configureDisplay(displayID, enabled: true) else { continue }
-                Self.forgetDisplaySwitchedOff(displayID)
-            }
+        for id in stored {
+            // The list is plain numbers on disk and can arrive edited or
+            // imported, so anything that is not a display number is skipped
+            // rather than converted.
+            guard let displayID = CGDirectDisplayID(exactly: id) else { continue }
+            deferredRestoration.keep(displayID)
+            guard restoreDisplay(displayID) == .success else { continue }
+            Self.forgetDisplaySwitchedOff(displayID)
         }
     }
 
     // MARK: - Brightness keys (follow the pointer)
 
     private func syncKeyTap() {
+        guard !tapsAreSuspended() else { return }
         let defaults = UserDefaults.standard
         let wantsKeyRouting = defaults.bool(forKey: DefaultsKey.brightnessKeysEnabled)
-        let wantsBrightnessOSD = defaults.bool(
-            forKey: DefaultsKey.brightnessOSDEnabled
-        ) && brightnessOSDSupported
-        let wanted = running
-            && (wantsKeyRouting || wantsBrightnessOSD)
-            && Permissions.shared.accessibility
+        // An island away in full screen, or set to stay hidden until hover,
+        // shows no notices while closed, so its keys keep the system's own
+        // feedback. The plain key tap runs on its own thread and keeps this
+        // sample; the island asks for a new one when full screen hides it.
+        let wantsBrightnessOSD = BrightnessSupport.overlayReplacesNative(
+            overlayEnabled: defaults.bool(forKey: DefaultsKey.brightnessOSDEnabled),
+            islandRoutes: NotchSupport.routes(.brightness),
+            islandShowsNotices: NotchService.shared.acceptsSystemFeedback
+                && !NotchSupport.hidesUntilHover(in: defaults)) && brightnessOSDSupported
+        let wantsKeyboardLight = NotchSupport.routes(.keyboardLight) && keyboardLightBridge != nil
+        if !wantsKeyboardLight || !SessionActivity.shared.isActive {
+            keyboardNoticeWork?.cancel(); keyboardNoticeWork = nil
+        }
+        let wanted = SessionActivitySupport.tapShouldRun(
+            featureWanted: (running && (wantsKeyRouting || wantsBrightnessOSD)) || wantsKeyboardLight,
+            accessibilityGranted: AXIsProcessTrusted(),
+            sessionIsActive: SessionActivity.shared.isActive)
         if wanted { installKeyTap() } else { removeKeyTap() }
-        // The plain key press path only earns its keystroke tap when the
-        // pointer actually decides the target.
-        if wanted, wantsKeyRouting {
+        // Other keyboards send brightness as plain key presses. Their
+        // keystroke tap is only earned when this app answers a brightness key
+        // instead of the system: the pointer decides the target, or an overlay
+        // or the island stands in for the system's own.
+        if wanted, running, BrightnessSupport.answersPlainBrightnessKeys(followsPointer: wantsKeyRouting,
+                                                                          overlayReplacesNative: wantsBrightnessOSD) {
             let hotKeys = UserDefaults(suiteName: "com.apple.symbolichotkeys")?
                 .dictionary(forKey: "AppleSymbolicHotKeys")
             let adjusts = BrightnessSupport.functionKeysAdjustBrightness(symbolicHotKeys: hotKeys)
             let overlayReplaces = wantsBrightnessOSD
+            let systemTarget = systemKeyTarget?.id
             keyThreadLock.withLock {
                 functionKeysAdjustBrightness = adjusts
                 overlayReplacesNativeOSD = overlayReplaces
+                functionKeysFollowPointer = wantsKeyRouting
+                functionKeySystemTarget = systemTarget
             }
             installFunctionKeyTap()
         } else {
@@ -610,8 +1015,15 @@ final class BrightnessService: ObservableObject {
         }
     }
 
+    /// The display the system's own brightness keys move: the built-in panel,
+    /// or in clamshell mode a display on the same system pipeline.
+    private var systemKeyTarget: BrightnessDisplay? {
+        displays.first(where: { $0.isBuiltIn && $0.isActive && $0.method == .system })
+            ?? displays.first(where: { $0.isActive && $0.method == .system })
+    }
+
     private func installKeyTap() {
-        guard keyTap == nil else { return }
+        guard !tapsAreSuspended(), keyTap == nil else { return }
         let systemDefined = CGEventType(rawValue: CleaningSystemKeyEvent.systemDefinedEventTypeRawValue)!
         let callback: CGEventTapCallBack = { _, type, event, userInfo in
             guard let userInfo else { return Unmanaged.passUnretained(event) }
@@ -638,14 +1050,36 @@ final class BrightnessService: ObservableObject {
         if let keyTapSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), keyTapSource, .commonModes)
         }
+        CFMachPortInvalidate(tap)
         keyTapSource = nil
         keyTap = nil
     }
 
     // MARK: - Brightness keys on other keyboards
 
+    /// Stops only the media-key and ordinary-function-key event taps before a
+    /// permission reset. This intentionally leaves display routes, observers,
+    /// OSD state, disabled displays and gamma curves untouched. The guard
+    /// keeps session/rebuild callbacks from bringing either tap back while
+    /// the reset is in progress. MUST run on the main thread.
+    func suspendInputTaps() {
+        keyThreadLock.withLock { inputTapsSuspended = true }
+        removeKeyTap()
+        removeFunctionKeyTap()
+    }
+
+    /// Ends the reset-only guard after TCC work has completed (or an
+    /// uninstall aborts before TCC is touched), then lets the normal
+    /// preference and permission checks decide whether to reinstall the taps.
+    /// MUST run on the main thread.
+    func resumeInputTaps() {
+        keyThreadLock.withLock { inputTapsSuspended = false }
+        syncKeyTap()
+    }
+
     private func installFunctionKeyTap() {
         let thread = keyThreadLock.withLock { () -> Thread? in
+            guard !inputTapsSuspended else { return nil }
             if functionKeyThread != nil {
                 if shouldStopFunctionKeyThread { pendingFunctionKeyRestart = true }
                 return nil
@@ -721,6 +1155,7 @@ final class BrightnessService: ObservableObject {
             }
             CGEvent.tapEnable(tap: tap, enable: false)
             CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFMachPortInvalidate(tap)
             if clearFunctionKeyThread() { installFunctionKeyTap() }
         }
     }
@@ -745,8 +1180,23 @@ final class BrightnessService: ObservableObject {
     /// server and the route from behind the state lock.
     private func routeFunctionKey(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            let tap = keyThreadLock.withLock { shouldStopFunctionKeyThread ? nil : functionKeyTap }
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            let shouldSync = keyThreadLock.withLock { () -> Bool in
+                guard SessionActivity.shared.isActive, AXIsProcessTrusted(),
+                      !shouldStopFunctionKeyThread, let tap = functionKeyTap else {
+                    return true
+                }
+                guard !inputTapsSuspended else { return false }
+                // Keep the lock through the enable so a main-thread suspend
+                // cannot disable the tap and then lose a race to re-enable it.
+                CGEvent.tapEnable(tap: tap, enable: true)
+                return false
+            }
+            if shouldSync {
+                DispatchQueue.main.async { [weak self] in self?.syncKeyTap() }
+            }
+            return Unmanaged.passUnretained(event)
+        }
+        guard !tapsAreSuspended() else {
             return Unmanaged.passUnretained(event)
         }
         guard type == .keyDown || type == .keyUp else {
@@ -774,25 +1224,30 @@ final class BrightnessService: ObservableObject {
             functionKeysAdjustBrightness: adjusts)
         else { return Unmanaged.passUnretained(event) }
 
-        var displayID: CGDirectDisplayID = 0
+        let (followsPointer, systemTarget, overlayReplacesNative) = keyThreadLock.withLock {
+            (functionKeysFollowPointer, functionKeySystemTarget, overlayReplacesNativeOSD)
+        }
+        var pointerDisplay: CGDirectDisplayID = 0
         var matched: UInt32 = 0
-        guard CGGetDisplaysWithPoint(event.location, 1, &displayID, &matched) == .success,
-              matched > 0
+        let underPointer = followsPointer
+            && CGGetDisplaysWithPoint(event.location, 1, &pointerDisplay, &matched) == .success && matched > 0
+        guard let displayID = BrightnessSupport.plainKeyTarget(followsPointer: followsPointer,
+                                                               pointerDisplay: underPointer ? pointerDisplay : nil,
+                                                               systemTarget: systemTarget)
         else { return Unmanaged.passUnretained(event) }
 
         stateLock.lock()
         let route = routes[displayID]
         stateLock.unlock()
-        guard let route else { return Unmanaged.passUnretained(event) }
+        guard let route, followsPointer || route.method == .system else { return Unmanaged.passUnretained(event) }
         if route.method == .system {
             // Same rule the media keys follow, so both kinds of keyboard
             // behave alike: the built-in panel keeps the system's own handling
             // and its animation unless the app's own overlay replaces it, and
             // every other system-routed display has to be stepped here,
             // because the system only ever moves its native target.
-            let overlayReplacesNative = keyThreadLock.withLock { overlayReplacesNativeOSD }
             guard BrightnessSupport.stepsSystemRoutedDisplay(
-                followsPointer: true,
+                followsPointer: followsPointer,
                 displayIsBuiltIn: CGDisplayIsBuiltin(displayID) != 0,
                 overlayReplacesNative: overlayReplacesNative
             ), BrightnessBridge.setBrightness != nil else {
@@ -810,6 +1265,7 @@ final class BrightnessService: ObservableObject {
     private func applyKeyStep(_ press: BrightnessSupport.BrightnessKeyEvent,
                               to displayID: CGDirectDisplayID,
                               method: BrightnessDisplay.Method) {
+        // The island shows the step on its own; the overlay needs its option.
         let showOSD = UserDefaults.standard.bool(forKey: DefaultsKey.brightnessOSDEnabled)
         step(displayID, method: method, delta: press.delta, showOSD: showOSD)
     }
@@ -843,8 +1299,9 @@ final class BrightnessService: ObservableObject {
                                                             window: Self.levelTrustWindow)
         // Gamma dimming is this app's own doing, so the remembered value is
         // the truth by construction and there is nothing to ask.
-        guard method == .ddc, route?.ddcReadable == true, !fresh,
-              let route, let service = route.service else {
+        guard method == .ddc, let route, route.ddcReadable, !fresh,
+              (!route.extendedDimming || (cached ?? 1) >= BrightnessSupport.extendedDimmingRange),
+              let service = route.service else {
             guard let current = cached else { return }
             commitStep(from: current, delta: delta, to: displayID, method: method, showOSD: showOSD)
             return
@@ -863,7 +1320,16 @@ final class BrightnessService: ObservableObject {
         workQueue.async { [weak self] in
             guard let self else { return }
             let probe = self.ddcProbeLuminance(for: displayID, service: service)
-            if case .replied = probe {
+            if case let .replied(value, _) = probe {
+                // Writes share this queue with the read. Remember the hardware
+                // answer before the step is queued, so an external adjustment
+                // cannot make a necessary write look like a duplicate.
+                self.stateLock.lock()
+                if self.routes[displayID]?.ddcPathKey == route.ddcPathKey,
+                   self.routes[displayID]?.extendedDimming == route.extendedDimming {
+                    self.routes[displayID]?.lastDDCValue = value
+                }
+                self.stateLock.unlock()
                 self.forgetWriteOnlyDDCPath(route.ddcPathKey)
             } else {
                 if case .writeOnly = probe {
@@ -872,6 +1338,7 @@ final class BrightnessService: ObservableObject {
                 self.stateLock.lock()
                 if self.routes[displayID]?.ddcPathKey == route.ddcPathKey {
                     self.routes[displayID]?.ddcReadable = false
+                    self.routes[displayID]?.lastDDCValue = nil
                 }
                 self.stateLock.unlock()
                 Self.log.log("ddc reads stopped answering for display \(displayID); future steps will write only")
@@ -879,9 +1346,22 @@ final class BrightnessService: ObservableObject {
             DispatchQueue.main.async {
                 let queued = self.ddcPendingSteps.removeValue(forKey: displayID) ?? 0
                 var current = cached
-                if case let .replied(value, maximum) = probe {
-                    let level = BrightnessSupport.normalized(
+                self.stateLock.lock()
+                let superseded = self.levelKnownAt[displayID] != known
+                let routeChanged = self.routes[displayID]?.ddcPathKey != route.ddcPathKey
+                    || self.routes[displayID]?.extendedDimming != route.extendedDimming
+                self.stateLock.unlock()
+                guard !routeChanged else { return }
+                if superseded {
+                    // A level set while the monitor was being read is newer than the read.
+                    current = self.displays.first(where: { $0.id == displayID })?.brightness ?? cached
+                } else if case let .replied(value, maximum) = probe {
+                    let hardware = BrightnessSupport.normalized(
                         current: value, maximum: BrightnessSupport.sanitizedMaximum(maximum))
+                    let level = route.extendedDimming
+                        ? BrightnessSupport.extendedDimmingLevel(
+                            hardware: hardware, remembered: nil, pictureDimmed: false)
+                        : hardware
                     Self.log.log("display \(displayID) reads \(level) before stepping")
                     current = level
                     if let index = self.displays.firstIndex(where: { $0.id == displayID }) {
@@ -909,21 +1389,37 @@ final class BrightnessService: ObservableObject {
     /// option is on, otherwise replacing only the system target's overlay.
     /// Both halves are swallowed so the system never performs the same step.
     private func handleKeyEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        guard !tapsAreSuspended() else { return Unmanaged.passUnretained(event) }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let keyTap { CGEvent.tapEnable(tap: keyTap, enable: true) }
+            if SessionActivity.shared.isActive, AXIsProcessTrusted(), let keyTap {
+                CGEvent.tapEnable(tap: keyTap, enable: true)
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.syncKeyTap() }
+            }
             return Unmanaged.passUnretained(event)
         }
         guard type.rawValue == CleaningSystemKeyEvent.systemDefinedEventTypeRawValue,
-              let nsEvent = NSEvent(cgEvent: event),
-              let press = BrightnessSupport.brightnessKeyEvent(subtype: Int(nsEvent.subtype.rawValue),
+              let nsEvent = NSEvent(cgEvent: event) else { return Unmanaged.passUnretained(event) }
+        if BrightnessSupport.isKeyboardLightPress(subtype: Int(nsEvent.subtype.rawValue), data1: nsEvent.data1) {
+            let modifiers = nsEvent.modifierFlags
+            if modifiers.intersection([.command, .control]).isEmpty,
+               !modifiers.contains(.option) || modifiers.contains(.shift) {
+                scheduleKeyboardLightNotice()
+            }
+            return Unmanaged.passUnretained(event)
+        }
+        guard running, let press = BrightnessSupport.brightnessKeyEvent(subtype: Int(nsEvent.subtype.rawValue),
                                                                data1: nsEvent.data1)
         else { return Unmanaged.passUnretained(event) }
 
         let defaults = UserDefaults.standard
         let followsPointer = defaults.bool(forKey: DefaultsKey.brightnessKeysEnabled)
-        let wantsBrightnessOSD = defaults.bool(
-            forKey: DefaultsKey.brightnessOSDEnabled
-        )
+        let showsOverlay = defaults.bool(forKey: DefaultsKey.brightnessOSDEnabled)
+        // This tap runs on the main thread, so every press asks the island
+        // whether it shows notices right now.
+        let wantsBrightnessOSD = BrightnessSupport.overlayReplacesNative(
+            overlayEnabled: showsOverlay, islandRoutes: NotchSupport.routes(.brightness),
+            islandShowsNotices: NotchService.shared.showsSystemFeedback)
         let displayID: CGDirectDisplayID
         if followsPointer {
             let pointer = NSEvent.mouseLocation
@@ -934,12 +1430,7 @@ final class BrightnessService: ObservableObject {
                 return Unmanaged.passUnretained(event)
             }
             displayID = id
-        } else if wantsBrightnessOSD,
-                  let systemTarget = displays.first(where: {
-                      $0.isBuiltIn && $0.isActive && $0.method == .system
-                  }) ?? displays.first(where: {
-                      $0.isActive && $0.method == .system
-                  }) {
+        } else if wantsBrightnessOSD, let systemTarget = systemKeyTarget {
             // With pointer routing off, keep the native target. In clamshell
             // mode this can be a system-managed external display.
             displayID = systemTarget.id
@@ -977,7 +1468,7 @@ final class BrightnessService: ObservableObject {
             ) {
                 let stepped = BrightnessSupport.steppedBrightness(current, delta: press.delta)
                 Self.log.log("key step display \(displayID) route system \(current) to \(stepped)")
-                setBrightness(stepped, for: displayID, showOSD: wantsBrightnessOSD)
+                setBrightness(stepped, for: displayID, showOSD: showsOverlay)
             }
             // Both halves are replaced so the system never draws a second OSD.
             return nil
@@ -986,7 +1477,7 @@ final class BrightnessService: ObservableObject {
             return Unmanaged.passUnretained(event)
         }
         if press.isKeyDown {
-            step(displayID, method: route.method, delta: press.delta, showOSD: wantsBrightnessOSD)
+            step(displayID, method: route.method, delta: press.delta, showOSD: showsOverlay)
         }
         return nil
     }
@@ -1053,14 +1544,27 @@ final class BrightnessService: ObservableObject {
         guard !candidates.isEmpty else { return false }
 
         pendingDisplayIDs.formUnion(candidates)
-        workQueue.async { [weak self] in
+        // Already on the main thread, which is where the reconfiguration has
+        // to run (see `configureDisplay`); the hop only lets the pending state
+        // reach the panel before the transaction blocks it.
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             var restored: CGDirectDisplayID?
-            for id in candidates where Self.configureDisplay(id, enabled: true) {
-                restored = id
-                break
+            var failure: DisplayControlFailure = .closedLid
+            for id in candidates {
+                let result = Self.configureDisplay(id, enabled: true)
+                self.deferredRestoration.recordHeadless(id, result: result)
+                self.syncLidObserver()
+                if result == .success { self.displayControlFailure = nil }
+                if result == .success {
+                    restored = id
+                    break
+                }
+                if result == .failed { failure = .failed }
             }
             if let restored {
+                self.deferredRestoration.cancelHeadless()
+                self.syncLidObserver()
                 self.stateLock.lock()
                 self.managedDisabledIDs.remove(restored)
                 self.managedDisabledDisplays.removeValue(forKey: restored)
@@ -1070,12 +1574,9 @@ final class BrightnessService: ObservableObject {
             } else {
                 Self.log.error("could not restore a display after the active display set became empty")
             }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.pendingDisplayIDs.subtract(candidates)
-                self.displayControlFailure = restored == nil ? .failed : nil
-                self.refresh(force: true)
-            }
+            self.pendingDisplayIDs.subtract(candidates)
+            self.displayControlFailure = restored == nil ? failure : nil
+            self.refresh(force: true)
         }
         return true
     }
@@ -1126,7 +1627,8 @@ final class BrightnessService: ObservableObject {
 
     // MARK: - Rebuild (work queue)
 
-    private func rebuild(generation: Int, previousDisplays: [BrightnessDisplay]) {
+    private func rebuild(generation: Int, previousDisplays: [BrightnessDisplay],
+                         screenNames: [CGDirectDisplayID: String]) {
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
         var count: UInt32 = 0
         CGGetOnlineDisplayList(16, &ids, &count)
@@ -1137,19 +1639,24 @@ final class BrightnessService: ObservableObject {
         var built: [BrightnessDisplay] = []
         var newRoutes: [CGDirectDisplayID: Route] = [:]
         var ddcCandidates: [(index: Int, identity: BrightnessSupport.DisplayIdentity)] = []
+        var virtualIDs = Set<CGDirectDisplayID>()
 
         for id in onlineIDs {
+            let info = Self.displayInfoDictionary(id)
+            // Read before the mirroring guard below, so the snapshot the panel
+            // decides from covers every online display, exactly like the live
+            // reading it replaces.
+            if (info?["kCGDisplayIsVirtualDevice"] as? Bool ?? false) { virtualIDs.insert(id) }
             // A mirroring display follows its source; the source's slider is
             // the real control.
             guard CGDisplayMirrorsDisplay(id) == 0 else { continue }
-            let info = Self.displayInfoDictionary(id)
             if let info,
                (info["kCGDisplayIsVirtualDevice"] as? Bool ?? false)
                 || (info["kCGDisplayIsAirPlay"] as? Bool ?? false) {
                 continue
             }
             let isBuiltIn = CGDisplayIsBuiltin(id) != 0
-            let name = Self.displayName(id, info: info)
+            let name = Self.displayName(id, info: info, screenNames: screenNames)
             let isActive = activeTopology.contains(id)
 
             if !isActive {
@@ -1199,6 +1706,10 @@ final class BrightnessService: ObservableObject {
                                            brightness: 0.5, readable: false))
         }
 
+        let drawableIDs = BrightnessSupport.drawableDisplayIDs(
+            onlineDisplayIDs: seenTopology, activeDisplayIDs: activeTopology,
+            virtualDisplayIDs: virtualIDs)
+
         stateLock.lock()
         let disabledSnapshots = managedDisabledDisplays
         // Still the previous rebuild's set at this point: what was not in it
@@ -1231,11 +1742,13 @@ final class BrightnessService: ObservableObject {
                                          isBuiltIn: display.isBuiltIn,
                                          method: previous.method, isActive: true,
                                          brightness: previous.brightness,
-                                         readable: previous.readable)
+                                         readable: previous.readable,
+                                         canChooseDimming: previous.canChooseDimming)
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.running, generation == self.rebuildGeneration else { return }
                 if self.displays != discovered { self.displays = discovered }
+                if self.drawableDisplays != drawableIDs { self.drawableDisplays = drawableIDs }
             }
         }
 
@@ -1244,6 +1757,9 @@ final class BrightnessService: ObservableObject {
         // Whatever ends up without a live DDC channel falls back to gamma
         // dimming, so every real display keeps a working slider.
         var softwareIndices = Set(ddcCandidates.map(\.index))
+        var forcedSoftwareIDs = Set<CGDirectDisplayID>()
+        var extendedDimmingIDs = Set<CGDirectDisplayID>()
+        var softwarePathKeys: [CGDirectDisplayID: String] = [:]
         if !ddcCandidates.isEmpty, BrightnessBridge.ddcAvailable {
             let services = Self.externalServices()
             var scores: [(displayIndex: Int, serviceOrdinal: Int, score: Int)] = []
@@ -1272,6 +1788,14 @@ final class BrightnessService: ObservableObject {
                 let pathKey = BrightnessSupport.ddcPathKey(
                     displayFingerprint: Self.displayFingerprint(id),
                     ioDisplayLocation: ioDisplayLocation)
+                if let pathKey, forcedSoftwarePaths().contains(pathKey) {
+                    // Chosen by hand: leave the display in `softwareIndices`
+                    // so it takes the gamma route below, and do not spend a
+                    // probe on a channel whose answer was already rejected.
+                    forcedSoftwareIDs.insert(id)
+                    softwarePathKeys[id] = pathKey
+                    continue
+                }
                 let rememberedWriteOnly = !BrightnessSupport.shouldProbeDDC(
                     pathKey: pathKey, writeOnlyPaths: writeOnlyDDCPaths())
                 let probe: DDCProbe
@@ -1287,29 +1811,60 @@ final class BrightnessService: ObservableObject {
                 case .replied(let current, let maximum):
                     forgetWriteOnlyDDCPath(pathKey)
                     let ceiling = BrightnessSupport.sanitizedMaximum(maximum)
+                    let hardware = BrightnessSupport.normalized(current: current, maximum: ceiling)
+                    let wantsExtendedDimming = pathKey.map {
+                        extendedDimmingPaths().contains($0)
+                    } ?? false
+                    if wantsExtendedDimming { extendedDimmingIDs.insert(id) }
+                    if wantsExtendedDimming { captureGammaBaselineIfNeeded(id) }
+                    let extendsDimming = wantsExtendedDimming
+                        && gammaBaselines[id]?.fingerprint == Self.displayFingerprint(id)
+                    stateLock.lock()
+                    let remembered = rememberedLevel(for: id)
+                    stateLock.unlock()
+                    var level = extendsDimming
+                        ? BrightnessSupport.extendedDimmingLevel(
+                            hardware: hardware, remembered: remembered,
+                            pictureDimmed: dimmedDisplays.contains(id))
+                        : hardware
+                    if extendsDimming {
+                        if !previousTopology.contains(id) {
+                            level = BrightnessSupport.reconnectedDimLevel(level)
+                        }
+                        let picture = BrightnessSupport.extendedDimmingComponents(for: level).picture
+                        if picture < 0.999 || dimmedDisplays.contains(id) {
+                            _ = applySoftwareDim(id, value: picture)
+                        }
+                    }
                     built[candidate.index] = BrightnessDisplay(
                         id: id, name: built[candidate.index].name, isBuiltIn: false,
-                        method: .ddc, isActive: true,
-                        brightness: BrightnessSupport.normalized(current: current,
-                                                                 maximum: ceiling),
-                        readable: true)
+                        method: .ddc, isActive: true, brightness: level,
+                        readable: true, canChooseDimming: pathKey != nil)
                     newRoutes[id] = Route(method: .ddc, service: matched.service,
                                           maximum: ceiling, ddcReadable: true,
-                                          ddcPathKey: pathKey)
+                                          ddcPathKey: pathKey, extendedDimming: extendsDimming,
+                                          lastDDCValue: current)
                     stateLock.lock()
                     levelKnownAt[id] = Date()
                     stateLock.unlock()
                     softwareIndices.remove(candidate.index)
                 case .writeOnly:
+                    if let pathKey, extendedDimmingPaths().contains(pathKey) {
+                        extendedDimmingIDs.insert(id)
+                    }
                     rememberWriteOnlyDDCPath(pathKey)
                     // Reads fail on some monitors whose writes still work:
                     // keep the slider, seeded from this session's last value.
                     stateLock.lock()
-                    let seed = rememberedLevel(for: id) ?? 0.5
+                    let remembered = rememberedLevel(for: id) ?? 0.5
+                    let seed = routes[id]?.extendedDimming == true
+                        ? BrightnessSupport.extendedDimmingComponents(for: remembered).hardware
+                        : remembered
                     stateLock.unlock()
                     built[candidate.index] = BrightnessDisplay(
                         id: id, name: built[candidate.index].name, isBuiltIn: false,
-                        method: .ddc, isActive: true, brightness: seed, readable: false)
+                        method: .ddc, isActive: true, brightness: seed,
+                        readable: false, canChooseDimming: pathKey != nil)
                     newRoutes[id] = Route(method: .ddc, service: matched.service,
                                           maximum: 100, ddcPathKey: pathKey)
                     softwareIndices.remove(candidate.index)
@@ -1324,7 +1879,7 @@ final class BrightnessService: ObservableObject {
         }
 
         // Software route for everything left over: capture the display's
-        // clean gamma curve, restore this session's dim level and reapply it
+        // clean gamma curve and put back a dim this app applied itself
         // (reconfigurations and wake reset gamma behind our back).
         // A display that drops off for a moment, which is what a hub
         // renegotiating or a cable settling looks like, comes back needing
@@ -1338,7 +1893,14 @@ final class BrightnessService: ObservableObject {
         for index in softwareIndices.sorted() {
             let id = built[index].id
             stateLock.lock()
-            var value = rememberedLevel(for: id) ?? 1.0
+            let remembered = rememberedLevel(for: id)
+            let previousExtended = routes[id]?.extendedDimming == true
+            let softwareLevel = previousExtended
+                ? remembered.map { BrightnessSupport.extendedDimmingComponents(for: $0).picture }
+                : remembered
+            var value = BrightnessSupport.softwareDimToRestore(
+                remembered: softwareLevel,
+                appliedByApp: dimmedDisplays.contains(id))
             stateLock.unlock()
             captureGammaBaselineIfNeeded(id)
             guard gammaBaselines[id] != nil else { continue }
@@ -1354,9 +1916,19 @@ final class BrightnessService: ObservableObject {
             }
             built[index] = BrightnessDisplay(
                 id: id, name: built[index].name, isBuiltIn: false,
-                method: .software, isActive: true, brightness: value, readable: true)
-            newRoutes[id] = Route(method: .software, service: nil, maximum: 100)
-            if value < 0.999 { _ = applySoftwareDim(id, value: value) }
+                method: .software, isActive: true, brightness: value, readable: true,
+                canChooseDimming: softwarePathKeys[id] != nil)
+            newRoutes[id] = Route(method: .software, service: nil, maximum: 100,
+                                  ddcPathKey: softwarePathKeys[id])
+            if value < 0.999 || dimmedDisplays.contains(id) {
+                _ = applySoftwareDim(id, value: value)
+            }
+        }
+        // A DDC or system route owns the picture again. A gamma curve left
+        // from an earlier extended route would otherwise keep it dark.
+        for id in Array(dimmedDisplays) where newRoutes[id]?.method != .software
+            && newRoutes[id]?.extendedDimming != true {
+            _ = applySoftwareDim(id, value: 1)
         }
         var resolved: [BrightnessDisplay] = []
         var supportsBrightnessOSD = false
@@ -1414,6 +1986,13 @@ final class BrightnessService: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.running, generation == self.rebuildGeneration else { return }
             if self.displays != resolved { self.displays = resolved }
+            if self.softwareDimmingPreferred != forcedSoftwareIDs {
+                self.softwareDimmingPreferred = forcedSoftwareIDs
+            }
+            if self.extendedDimmingPreferred != extendedDimmingIDs {
+                self.extendedDimmingPreferred = extendedDimmingIDs
+            }
+            if self.drawableDisplays != drawableIDs { self.drawableDisplays = drawableIDs }
             if self.brightnessOSDSupported != supportsBrightnessOSD {
                 self.brightnessOSDSupported = supportsBrightnessOSD
             }
@@ -1446,6 +2025,11 @@ final class BrightnessService: ObservableObject {
                 writeSucceeded = BrightnessBridge.setBrightness?(id, Float(value)) == 0
             case .ddc:
                 guard let service = route.service else { continue }
+                if route.extendedDimming {
+                    writeSucceeded = writeExtendedBrightness(value, to: id,
+                                                             route: route, service: service)
+                    break
+                }
                 let deviceValue = BrightnessSupport.deviceValue(for: value,
                                                                 maximum: route.maximum)
                 let packet = BrightnessSupport.writePacket(
@@ -1471,9 +2055,7 @@ final class BrightnessService: ObservableObject {
             if writeSucceeded, let osdLevel {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.running,
-                          UserDefaults.standard.bool(
-                              forKey: DefaultsKey.brightnessOSDEnabled
-                          ) else { return }
+                          UserDefaults.standard.bool(forKey: DefaultsKey.brightnessOSDEnabled) else { return }
                     self.stateLock.lock()
                     let current = self.rebuildGeneration
                     let latestWrite = self.writeSequence
@@ -1485,6 +2067,37 @@ final class BrightnessService: ObservableObject {
                 }
             }
         }
+    }
+
+    /// The monitor stays at its hardware minimum while the lower part of the
+    /// slider scales its picture. Restoring the picture before a brighter DDC
+    /// write keeps a failed gamma restore from leaving a black screen at high
+    /// backlight power.
+    private func writeExtendedBrightness(_ value: Double, to id: CGDirectDisplayID,
+                                         route: Route, service: CFTypeRef) -> Bool {
+        let components = BrightnessSupport.extendedDimmingComponents(for: value)
+        if components.picture >= 0.999, dimmedDisplays.contains(id),
+           !applySoftwareDim(id, value: 1) { return false }
+
+        let deviceValue = BrightnessSupport.deviceValue(for: components.hardware,
+                                                        maximum: route.maximum)
+        var hardwareSucceeded = true
+        if route.lastDDCValue != deviceValue {
+            let packet = BrightnessSupport.writePacket(code: BrightnessSupport.luminanceCode,
+                                                       value: deviceValue)
+            hardwareSucceeded = ddcSend(to: id, service: service, packet: packet)
+            if hardwareSucceeded {
+                stateLock.lock()
+                if routes[id]?.ddcPathKey == route.ddcPathKey,
+                   routes[id]?.extendedDimming == true {
+                    routes[id]?.lastDDCValue = deviceValue
+                }
+                stateLock.unlock()
+            }
+        }
+        let pictureSucceeded = components.picture >= 0.999
+            || applySoftwareDim(id, value: components.picture)
+        return hardwareSucceeded && pictureSucceeded
     }
 
     // MARK: - Software dimming (work queue)
@@ -1584,6 +2197,93 @@ final class BrightnessService: ObservableObject {
         case dead
     }
 
+    private func forcedSoftwarePaths() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(
+            forKey: DefaultsKey.brightnessForcedSoftwarePaths
+        ) ?? [])
+    }
+
+    private func extendedDimmingPaths() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(
+            forKey: DefaultsKey.brightnessExtendedDimmingPaths
+        ) ?? [])
+    }
+
+    /// Keeps the ordinary DDC route above the monitor's minimum and adds a
+    /// software range below it only for this monitor on this connection.
+    func setExtendedDimmingPreferred(_ preferred: Bool, for id: CGDirectDisplayID) {
+        stateLock.lock()
+        let pathKey = routes[id]?.ddcPathKey
+        if pathKey != nil {
+            pendingLevels.removeValue(forKey: id)
+        }
+        if pathKey != nil && !preferred {
+            lastApplied[id] = nil
+            levelKnownAt[id] = nil
+        }
+        stateLock.unlock()
+        guard let pathKey else { return }
+        let defaults = UserDefaults.standard
+        let stored = defaults.stringArray(forKey: DefaultsKey.brightnessExtendedDimmingPaths) ?? []
+        let updated = BrightnessSupport.updatedWriteOnlyDDCPaths(
+            stored, path: pathKey, isWriteOnly: preferred)
+        if updated != stored {
+            defaults.set(updated, forKey: DefaultsKey.brightnessExtendedDimmingPaths)
+        }
+        Self.log.log("display \(id) extended dimming preferred \(preferred)")
+        guard !preferred else {
+            refresh(force: true)
+            return
+        }
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            if self.dimmedDisplays.contains(id) {
+                self.applySoftwareDim(id, value: 1)
+            }
+            DispatchQueue.main.async { [weak self] in self?.refresh(force: true) }
+        }
+    }
+
+    /// Moves one display between the DDC and the gamma route by hand. Clearing
+    /// the cached write-only verdict matters as much as the preference itself:
+    /// turning the choice back off has to let the channel be probed again
+    /// rather than reuse the answer that pinned the display here.
+    func setSoftwareDimmingPreferred(_ preferred: Bool, for id: CGDirectDisplayID) {
+        stateLock.lock()
+        let pathKey = routes[id]?.ddcPathKey
+        stateLock.unlock()
+        guard let pathKey else { return }
+        let defaults = UserDefaults.standard
+        let stored = defaults.stringArray(forKey: DefaultsKey.brightnessForcedSoftwarePaths) ?? []
+        let updated = BrightnessSupport.updatedWriteOnlyDDCPaths(
+            stored, path: pathKey, isWriteOnly: preferred)
+        if updated != stored {
+            defaults.set(updated, forKey: DefaultsKey.brightnessForcedSoftwarePaths)
+        }
+        forgetWriteOnlyDDCPath(pathKey)
+        Self.log.log("display \(id) software dimming preferred \(preferred)")
+        guard !preferred else {
+            refresh(force: true)
+            return
+        }
+        // Handing the display back to DDC has to hand the picture back with
+        // it. The scaled curve belongs to this app, and the level behind it
+        // describes the gamma route, not the monitor: left in place they show
+        // a dark screen the monitor's own controls cannot explain, and the
+        // first write to the panel then dims what is already dimmed. The
+        // curve goes back before the rebuild, so the probe reads a display
+        // showing its own picture.
+        stateLock.lock()
+        lastApplied[id] = nil
+        levelKnownAt[id] = nil
+        stateLock.unlock()
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            self.applySoftwareDim(id, value: 1)
+            DispatchQueue.main.async { [weak self] in self?.refresh(force: true) }
+        }
+    }
+
     private func writeOnlyDDCPaths() -> Set<String> {
         Set(UserDefaults.standard.stringArray(
             forKey: DefaultsKey.brightnessDDCWriteOnlyPaths
@@ -1626,9 +2326,10 @@ final class BrightnessService: ObservableObject {
         var request = BrightnessSupport.readRequestPacket(code: BrightnessSupport.luminanceCode)
         var writeAccepted = false
         let attempts = BrightnessSupport.ddcProbeAttempts()
-        let writeCycles = BrightnessSupport.ddcProbeWriteCycles(
-            classifyingChannel: classifyingChannel)
         for attempt in 0..<attempts {
+            let writeCycles = BrightnessSupport.ddcProbeWriteCycles(
+                classifyingChannel: classifyingChannel,
+                isFinalAttempt: attempt + 1 == attempts)
             for _ in 0..<writeCycles {
                 usleep(BrightnessSupport.writePauseMicroseconds)
                 if write(service, BrightnessSupport.chipAddress,
@@ -1661,12 +2362,9 @@ final class BrightnessService: ObservableObject {
         return create(id)?.takeRetainedValue() as NSDictionary?
     }
 
-    private static func displayName(_ id: CGDirectDisplayID, info: NSDictionary?) -> String {
-        if let screen = NSScreen.screens.first(where: {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
-        }) {
-            return screen.localizedName
-        }
+    private static func displayName(_ id: CGDirectDisplayID, info: NSDictionary?,
+                                    screenNames: [CGDirectDisplayID: String]) -> String {
+        if let name = screenNames[id] { return name }
         if let names = info?["DisplayProductName"] as? [String: String],
            let name = names["en_US"] ?? names.first?.value {
             return name
@@ -1764,7 +2462,10 @@ final class BrightnessService: ObservableObject {
 /// through dlopen/dlsym and the feature degrades gracefully wherever one is
 /// missing: no system brightness symbol means no built-in slider, no I2C
 /// symbols mean no external sliders, never a crash.
-private enum BrightnessBridge {
+/// Also used by `LidDisplayDimmer` to write the built-in panel directly by
+/// ID while the lid is closed, when it is off `CGGetOnlineDisplayList`'s
+/// active subset and this class's own display rows do not cover it.
+enum BrightnessBridge {
     typealias GetBrightnessFn = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
     typealias SetBrightnessFn = @convention(c) (UInt32, Float) -> Int32
     typealias CreateInfoDictionaryFn = @convention(c) (UInt32) -> Unmanaged<CFDictionary>?

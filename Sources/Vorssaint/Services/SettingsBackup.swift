@@ -40,7 +40,7 @@ enum SettingsBackup {
     /// Shows the open panel; nil = user cancelled.
     static func runImportPanel() -> URL? {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.propertyList]
+        panel.allowedContentTypes = [.propertyList, .xml]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         NSApp.activate(ignoringOtherApps: true)
@@ -50,7 +50,19 @@ enum SettingsBackup {
 
     /// Reads and validates a backup; nil when the file is not one of ours.
     static func readSettings(at url: URL) -> [String: Any]? {
-        guard let data = try? Data(contentsOf: url),
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        var coordinatedData: Data?
+        let coordinator = NSFileCoordinator()
+        var error: NSError?
+        coordinator.coordinate(readingItemAt: url, options: .withoutChanges, error: &error) { readURL in
+            coordinatedData = try? Data(contentsOf: readURL)
+        }
+        guard let data = coordinatedData ?? (try? Data(contentsOf: url)),
               let payload = try? PropertyListSerialization.propertyList(from: data,
                                                                         options: [],
                                                                         format: nil) as? [String: Any]
@@ -63,11 +75,46 @@ enum SettingsBackup {
     static func applyAndRelaunch(settings: [String: Any]) {
         ScratchpadService.shared.prepareForSettingsRestore()
         let defaults = UserDefaults.standard
-        for key in SettingsBackupSupport.exportKeys() {
+        let localRecorderPresets = defaults.data(forKey: DefaultsKey.recorderEditorPresets)
+        let localWatermark = defaults.string(forKey: DefaultsKey.screenshotWatermarkStyle)
+        let localWatermarkPresets = defaults.string(forKey: DefaultsKey.screenshotWatermarkPresets)
+        // A backup carries only the portable half of an exception list: the
+        // path of a program that is not an app is authority on one Mac and is
+        // filtered out on export (issue #1009). The clear below covers every
+        // exported key, so without carrying that half across by hand, applying
+        // a backup would delete those entries outright -- including on the Mac
+        // the file was written on, where nothing about them was ever wrong.
+        let carried = MouseExceptionScope.allCases.reduce(into: [String: [String]]()) { out, scope in
+            out[scope.defaultsKey] = SettingsBackupSupport.pathIdentities(
+                in: defaults.stringArray(forKey: scope.defaultsKey) ?? [])
+        }
+        let windowLayoutPaths = SettingsBackupSupport.pathIdentities(
+            in: defaults.stringArray(forKey: DefaultsKey.windowLayoutIgnoredApps) ?? [])
+        for key in SettingsBackupSupport.keysToClear(whenImporting: settings) {
             defaults.removeObject(forKey: key)
         }
         for (key, value) in settings {
             defaults.set(value, forKey: key)
+        }
+        if let restored = settings[DefaultsKey.recorderEditorPresets] as? Data {
+            defaults.set(SettingsBackupSupport.preservingLocalPresetImages(
+                restored: restored, local: localRecorderPresets), forKey: DefaultsKey.recorderEditorPresets)
+        }
+        defaults.set(SettingsBackupSupport.restoredScreenshotWatermark(
+            restored: settings[DefaultsKey.screenshotWatermarkStyle] as? String,
+            local: localWatermark), forKey: DefaultsKey.screenshotWatermarkStyle)
+        defaults.set(SettingsBackupSupport.restoredScreenshotWatermarkPresets(
+            restored: settings[DefaultsKey.screenshotWatermarkPresets] as? String,
+            local: localWatermarkPresets), forKey: DefaultsKey.screenshotWatermarkPresets)
+        for (key, paths) in carried where !paths.isEmpty {
+            defaults.set(SettingsBackupSupport.restoredExceptionList(
+                restored: defaults.stringArray(forKey: key) ?? [],
+                carried: paths), forKey: key)
+        }
+        if !windowLayoutPaths.isEmpty {
+            defaults.set(SettingsBackupSupport.restoredExceptionList(
+                restored: defaults.stringArray(forKey: DefaultsKey.windowLayoutIgnoredApps) ?? [],
+                carried: windowLayoutPaths), forKey: DefaultsKey.windowLayoutIgnoredApps)
         }
         FeatureRuntime.shared.relaunchApp()
     }

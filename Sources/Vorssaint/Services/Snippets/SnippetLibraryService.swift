@@ -41,7 +41,8 @@ final class SnippetLibraryService: ObservableObject {
             && UserDefaults.standard.bool(forKey: DefaultsKey.snippetLibraryEnabled)
         let shortcut = GlobalShortcut.saved(for: DefaultsKey.snippetLibraryShortcut,
                                             fallback: .snippetLibraryDefault)
-        shortcutRegistrationFailed = !hotkey.sync(enabled: enabled, shortcut: shortcut)
+        shortcutRegistrationFailed = !hotkey.sync(enabled: enabled, shortcut: shortcut,
+                                                  storageKey: DefaultsKey.snippetLibraryShortcut)
         if !enabled { hide() }
         if isVisible {
             reloadSnippets()
@@ -165,9 +166,12 @@ final class SnippetLibraryService: ObservableObject {
             }
             return
         }
+        let clipboard = TextSnippetSupport.needsClipboard(snippet.replacement)
+            ? NSPasteboard.general.string(forType: .string)
+            : nil
         let text = TextSnippetSupport.expand(snippet.replacement,
                                              date: Date(),
-                                             clipboard: NSPasteboard.general.string(forType: .string))
+                                             clipboard: clipboard)
         // A beat for the panel to leave the screen; the target app kept focus
         // (the panel never activates), so the caret is exactly where the user
         // left it.
@@ -213,7 +217,7 @@ final class SnippetLibraryService: ObservableObject {
 
     /// Borderless panels refuse key status by default, and the library needs
     /// it for the search field, arrows and Esc.
-    private final class KeyableLibraryPanel: NSPanel {
+    private final class KeyableLibraryPanel: OverlayPanel {
         override var canBecomeKey: Bool { true }
     }
 
@@ -275,6 +279,16 @@ final class SnippetLibraryService: ObservableObject {
         removeMonitors()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self, weak panel] event in
             guard let self, let panel, event.window === panel else { return event }
+
+            // While an input method is composing, Return confirms the
+            // candidate, the arrows walk it and Esc drops it. The panel edits
+            // through a field editor, so the marked range lives there; taking
+            // those keys would leave the search field unusable in Chinese,
+            // Japanese and Korean, so composition always wins.
+            if let editor = panel.firstResponder as? NSTextView, editor.hasMarkedText() {
+                return event
+            }
+
             switch Int(event.keyCode) {
             case kVK_Escape:
                 self.hide()
@@ -309,7 +323,10 @@ final class SnippetLibraryService: ObservableObject {
         }
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents) { [weak self, weak panel] event in
             guard let self, let panel, panel.isVisible else { return }
-            if event.windowNumber != panel.windowNumber, !Self.mouseIsInside(panel) {
+            if event.windowNumber != panel.windowNumber, !Self.mouseIsInside(panel),
+               // Every key on the Accessibility Keyboard is a click outside this
+               // panel. Dismissing on those makes the panel impossible to type into.
+               !AssistiveKeyboard.ownsCocoaPoint(NSEvent.mouseLocation) {
                 self.hide()
             }
         }
@@ -320,7 +337,8 @@ final class SnippetLibraryService: ObservableObject {
         ) { [weak self] notification in
             guard let self,
                   let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  app.bundleIdentifier != Bundle.main.bundleIdentifier
+                  app.bundleIdentifier != Bundle.main.bundleIdentifier,
+                  app.bundleIdentifier != AssistiveKeyboard.bundleID
             else { return }
             self.hide()
         }

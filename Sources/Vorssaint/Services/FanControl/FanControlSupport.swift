@@ -229,6 +229,11 @@ enum FanControlPolicy {
         validCoolingLevel(level) && level.isMultiple(of: coolingLevelStep)
     }
 
+    static func targetRPMMatches(target: Double, expected: Double) -> Bool {
+        target.isFinite && expected.isFinite
+            && abs(target - expected) <= max(2, expected * 0.001)
+    }
+
     static func coolingTargetRPM(minimum: Double, maximum: Double,
                                  level: Int) -> Double? {
         guard validBounds(minimum: minimum, maximum: maximum),
@@ -508,7 +513,14 @@ enum FanControlPolicy {
         let preferredCPU = validCPU.filter {
             TemperatureSensorSelector.isCPUCoreKey($0.key, platform: platform)
         }
-        let cpu = (preferredCPU.isEmpty ? validCPU : preferredCPU).map(\.value)
+        let cpu: [Double]
+        if TemperatureSensorSelector.hasCPUCoreSet(platform: platform) {
+            cpu = preferredCPU.map(\.value)
+        } else if platform == .generic {
+            cpu = validCPU.map(\.value)
+        } else {
+            cpu = []
+        }
         let gpu = gpuReadings.filter {
             $0 >= TemperatureSensorSelector.minimumChipTemperature && validTemperature($0)
         }

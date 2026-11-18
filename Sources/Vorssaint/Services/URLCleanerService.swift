@@ -7,16 +7,13 @@ import UniformTypeIdentifiers
 
 final class URLCleanerService: ObservableObject {
     static let shared = URLCleanerService()
-    private static let automaticRewriteTypes: Set<NSPasteboard.PasteboardType> = [
-        .string,
-        NSPasteboard.PasteboardType(UTType.url.identifier),
-        NSPasteboard.PasteboardType("public.url-name"),
-        NSPasteboard.PasteboardType("NSStringPboardType"),
-        NSPasteboard.PasteboardType("NSURLPboardType"),
-    ]
+    private static let urlType = NSPasteboard.PasteboardType(UTType.url.identifier)
 
     @Published private(set) var isRunning = false
     @Published private(set) var lastCleaned: String?
+    /// Names the last automatic clean took out, so Settings can say what the
+    /// silent rewrite did rather than only that it is running.
+    @Published private(set) var lastRemoved: [String] = []
 
     private final class PollToken {
         private let lock = NSLock()
@@ -37,7 +34,7 @@ final class URLCleanerService: ObservableObject {
 
     private struct PollResult {
         let changeCount: Int
-        let cleaned: String?
+        let cleaned: URLCleaning.Result?
     }
 
     private var timer: Timer?
@@ -55,17 +52,23 @@ final class URLCleanerService: ObservableObject {
         }
     }
 
-    func clean(_ text: String) -> String? {
-        URLCleaning.cleanedString(from: text, customParameters: Self.customParameters)
+    func clean(_ text: String) -> URLCleaning.Result? {
+        URLCleaning.clean(text, rules: Self.rules)
     }
 
+    /// Writes on the shared lane and settles the change count on the main
+    /// queue, where the poll compares against it. The caller never waits: the
+    /// lane can be wedged behind an app that promised pasteboard content and
+    /// stopped answering (issue #887).
     func copy(_ urlString: String) {
         cancelPoll()
-        let changeCount = GeneralPasteboardAccess.shared.sync {
-            Self.writeToPasteboard(urlString)
-        }
-        lastChangeCount = changeCount
         lastCleaned = urlString
+        GeneralPasteboardAccess.shared.async({
+            Self.writeToPasteboard(urlString)
+        }, then: { [weak self] changeCount in
+            guard let self else { return }
+            self.lastChangeCount = max(self.lastChangeCount, changeCount)
+        })
     }
 
     func stop() {
@@ -127,7 +130,8 @@ final class URLCleanerService: ObservableObject {
                 guard self.isRunning, let result else { return }
                 self.lastChangeCount = result.changeCount
                 if let cleaned = result.cleaned {
-                    self.lastCleaned = cleaned
+                    self.lastCleaned = cleaned.url
+                    self.lastRemoved = cleaned.removed
                 }
             }
         }
@@ -143,26 +147,28 @@ final class URLCleanerService: ObservableObject {
             return PollResult(changeCount: changeCount, cleaned: nil)
         }
 
-        guard let text = pasteboard.string(forType: .string),
-              let cleaned = URLCleaning.cleanedString(from: text, customParameters: customParameters),
-              cleaned != text.trimmingCharacters(in: .whitespacesAndNewlines),
-              canSafelyRewriteAutomatically(pasteboard),
+        // The types decide before any content is read: a picture or a file
+        // is never fetched only to be left alone. Some "copy link" commands
+        // put the link on the pasteboard only as a URL, with no text next
+        // to it.
+        guard URLCleaning.canRewritePasteboard(types: (pasteboard.types ?? []).map(\.rawValue)),
+              let text = pasteboard.string(forType: .string) ?? pasteboard.string(forType: urlType),
+              let cleaned = URLCleaning.clean(text, rules: rules),
+              cleaned.url != text.trimmingCharacters(in: .whitespacesAndNewlines),
               !token.isCancelled else {
             return PollResult(changeCount: changeCount, cleaned: nil)
         }
 
-        let rewrittenChangeCount = writeToPasteboard(cleaned)
+        let rewrittenChangeCount = writeToPasteboard(cleaned.url)
         return PollResult(changeCount: rewrittenChangeCount, cleaned: cleaned)
     }
 
-    private static func canSafelyRewriteAutomatically(_ pasteboard: NSPasteboard) -> Bool {
-        guard let types = pasteboard.types, !types.isEmpty else { return false }
-        return Set(types).isSubset(of: automaticRewriteTypes)
-    }
-
-    private static var customParameters: Set<String> {
-        URLCleaning.customParameters(from: UserDefaults.standard.string(
-            forKey: DefaultsKey.urlCleanerCustomParameters))
+    private static var rules: URLCleaning.Rules {
+        let defaults = UserDefaults.standard
+        return URLCleaning.rules(
+            globalNames: defaults.string(forKey: DefaultsKey.urlCleanerCustomParameters),
+            siteNames: defaults.string(forKey: DefaultsKey.urlCleanerSiteParameters),
+            disabledNames: defaults.string(forKey: DefaultsKey.urlCleanerDisabledParameters))
     }
 
     @discardableResult
@@ -170,7 +176,7 @@ final class URLCleanerService: ObservableObject {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(urlString, forType: .string)
-        pasteboard.setString(urlString, forType: NSPasteboard.PasteboardType(UTType.url.identifier))
+        pasteboard.setString(urlString, forType: urlType)
         return pasteboard.changeCount
     }
 

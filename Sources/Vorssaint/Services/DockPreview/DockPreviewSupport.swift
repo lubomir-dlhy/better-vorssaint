@@ -78,6 +78,28 @@ enum ParallShortcutResolver {
     }
 }
 
+enum DockPreviewFrameSupport {
+    /// Accept only the two ways a work-area reduction constrains a window:
+    /// clipping its bounds, or moving it inward while preserving its size.
+    static func wasConstrained(_ current: CGRect, original: CGRect, visibleFrame: CGRect) -> Bool {
+        guard !original.isEmpty, !visibleFrame.isEmpty,
+              !visibleFrame.contains(original), !current.isEmpty else { return false }
+        let size = CGSize(width: min(original.width, visibleFrame.width),
+                          height: min(original.height, visibleFrame.height))
+        let moved = CGRect(x: min(max(original.minX, visibleFrame.minX), visibleFrame.maxX - size.width),
+                           y: min(max(original.minY, visibleFrame.minY), visibleFrame.maxY - size.height),
+                           width: size.width, height: size.height)
+        return [original.intersection(visibleFrame), moved].contains { expected in
+            guard !expected.isEmpty, current != original else { return false }
+            let matchesX = abs(current.minX - expected.minX) <= 2
+            let matchesY = abs(current.minY - expected.minY) <= 2
+            let matchesWidth = abs(current.width - expected.width) <= 2
+            let matchesHeight = abs(current.height - expected.height) <= 2
+            return matchesX && matchesY && matchesWidth && matchesHeight
+        }
+    }
+}
+
 enum DockPreviewOrientation: String, Equatable {
     case bottom
     case left
@@ -142,6 +164,11 @@ struct DockPreviewCloseState: Equatable {
     let shouldEndSession: Bool
 }
 
+enum DockPreviewCloseAction: Equatable {
+    case closeWindow
+    case quitApp
+}
+
 struct DockPreviewMouseDownDecision: Equatable {
     let shouldEndSession: Bool
 }
@@ -162,7 +189,52 @@ struct HoverCorridor: Equatable {
     }
 }
 
+
+enum DockPreviewWindowOrder: Equatable {
+    case lastUse
+    case creation
+
+    static func fromDefaults(orderByCreation: Bool) -> DockPreviewWindowOrder {
+        orderByCreation ? .creation : .lastUse
+    }
+}
+
 enum DockPreviewSupport {
+    static func handlesMiddleClick(eventType: NSEvent.EventType, buttonNumber: Int,
+                                   point: CGPoint, visibleRect: CGRect, isHidden: Bool) -> Bool {
+        (eventType == .otherMouseDown || eventType == .otherMouseUp)
+            && buttonNumber == 2 && !isHidden && visibleRect.contains(point)
+    }
+
+    static func closeAction(quitAppOnClose: Bool) -> DockPreviewCloseAction {
+        quitAppOnClose ? .quitApp : .closeWindow
+    }
+
+    /// Reorders Dock Preview cards. Last-use keeps the enumerator’s MRU order;
+    /// creation sorts by ascending window ID (a stable creation-time proxy).
+    static func orderedWindows(_ windows: [SwitcherItem],
+                               order: DockPreviewWindowOrder) -> [SwitcherItem] {
+        switch order {
+        case .lastUse:
+            return windows
+        case .creation:
+            return windows.sorted { lhs, rhs in
+                (lhs.windowID ?? 0) < (rhs.windowID ?? 0)
+            }
+        }
+    }
+
+
+    static func performCloseAction(quitAppOnClose: Bool,
+                                   requestQuit: () -> Bool,
+                                   closeWindow: () -> Void) {
+        if closeAction(quitAppOnClose: quitAppOnClose) == .quitApp,
+           requestQuit() {
+            return
+        }
+        closeWindow()
+    }
+
     /// How long the cursor must rest on an icon before its panel opens. Long
     /// enough that the Dock can be crossed on the way somewhere else, short
     /// enough that a cursor which stopped is answered. Adjustable: that line
@@ -200,6 +272,11 @@ enum DockPreviewSupport {
     /// A little slack around the panel so the cursor grazing its edge doesn't
     /// flicker the session between "inside" and "leaving".
     static let panelStayMargin: CGFloat = 6
+    /// How far the pointer may drift and still count as the one the panel moved
+    /// out from under when an auto-hidden Dock leaves. Wide enough for the jitter
+    /// of a hand resting on a mouse, far short of a deliberate move away — tune
+    /// here if a real desk proves either end of that wrong.
+    static let reattachGraceTravel: CGFloat = 24
     static let edgePadding: CGFloat = 8
     static let panelGap: CGFloat = 6
     static let autohidePanelGap: CGFloat = 0
@@ -212,11 +289,13 @@ enum DockPreviewSupport {
     /// and a fullscreen window owns its Space and ignores the position it is
     /// given — dragging either one would move nothing while still tearing the
     /// panel down.
-    static func canDragToPlace(hasWindowID: Bool,
-                               isOnScreen: Bool,
-                               isMinimized: Bool,
-                               isFullscreen: Bool) -> Bool {
-        hasWindowID && isOnScreen && !isMinimized && !isFullscreen
+    /// A minimized window, or one parked on another desktop, is still a window
+    /// the user wants somewhere: the drop restores it and brings it here rather
+    /// than refusing the gesture. Fullscreen is the one refusal left -- it owns
+    /// a Space of its own and discards any position it is given, so a drag of
+    /// it could only ever pretend to work.
+    static func canDragToPlace(hasWindowID: Bool, isFullscreen: Bool) -> Bool {
+        hasWindowID && !isFullscreen
     }
 
     /// How far the pointer must travel before a press on a card becomes a
@@ -242,22 +321,72 @@ enum DockPreviewSupport {
         )
     }
 
-    /// Card metrics. The thumbnail gets whatever the fixed chrome does not
-    /// take, so the card can be resized or the title band retuned without
-    /// leaving a stale magic number behind — the old code hard-coded a 54pt
-    /// deduction that no longer matched the parts it stood for.
-    static var cardWidth: CGFloat { 176 * PreviewSizing.scale }
-    static var cardHeight: CGFloat { 134 * PreviewSizing.scale }
-    static var cardPadding: CGFloat { 8 * PreviewSizing.scale }
-    static var cardTitleSpacing: CGFloat { 5 * PreviewSizing.scale }
-    /// One line of 12pt semibold, with just enough room for descenders.
-    static var cardTitleHeight: CGFloat { 17 * PreviewSizing.scale }
-    static var cardThumbnailHeight: CGFloat {
-        cardHeight - cardPadding * 2 - cardTitleSpacing - cardTitleHeight
-    }
+    // Card metrics. The preview size setting sizes what the card shows, so the
+    // thumbnail and the icon standing in for it follow it, and so do the gaps
+    // around them, which hold nothing of their own. What does not follow it is
+    // anything sized by fixed content: the title band is one line of 12pt
+    // semibold at every setting, and the panel header holds a 16pt icon beside
+    // the same 12pt. Scaling the band with the card left that line adrift in
+    // 31pt of nothing at the largest size and squeezed into 13pt at the
+    // smallest, which is the one thing here that was actually wrong.
+    static var cardPadding: CGFloat { 10 * PreviewSizing.scale }
+    static var cardTitleSpacing: CGFloat { 7 * PreviewSizing.scale }
+    /// A 13pt name over a 10.5pt subtitle, beside the two 16pt window controls
+    /// -- the App Switcher's title block, to the point. Fixed: what it holds is
+    /// the same at every preview size.
+    static let cardTitleHeight: CGFloat = 29
     static var cardSpacing: CGFloat { 8 * PreviewSizing.scale }
-    static var panelPadding: CGFloat { 12 * PreviewSizing.scale }
+    static var panelPadding: CGFloat { 10 * PreviewSizing.scale }
     static let panelHeaderHeight: CGFloat = 28
+
+    /// 16:10, the shape of the screen the captured window came from, so a
+    /// full-height window fills the well instead of sitting between two bars.
+    /// The picture inside keeps a 5pt inset, which is why this is 210x135
+    /// rather than 200x125.
+    static func cardThumbnailSize(scale: CGFloat) -> CGSize {
+        CGSize(width: 210 * scale, height: 135 * scale)
+    }
+
+    /// Minimal previews have no title band, so the card drops its height
+    /// instead of padding the width-bound picture with space it cannot fill.
+    static func cardSize(scale: CGFloat, minimal: Bool = false) -> CGSize {
+        let thumbnail = cardThumbnailSize(scale: scale)
+        let padding = 10 * scale
+        return CGSize(width: thumbnail.width + padding * 2,
+                      height: thumbnail.height + padding * 2 + (minimal ? 0 : 7 * scale + cardTitleHeight))
+    }
+
+    /// The picture's inset inside the thumbnail well. It scales with the well,
+    /// so the 16:10 the well is cut to survives every preview size.
+    static func cardPictureSize(scale: CGFloat) -> CGSize {
+        let thumbnail = cardThumbnailSize(scale: scale)
+        let inset = 5 * scale
+        return CGSize(width: thumbnail.width - inset * 2, height: thumbnail.height - inset * 2)
+    }
+
+    static var cardThumbnailInset: CGFloat { 5 * PreviewSizing.scale }
+
+    /// The app's icon along the bottom edge of the picture, the size the App
+    /// Switcher draws it. App artwork sits on the system icon grid with a clear
+    /// margin around it, so the frame hangs past the row by that margin and the
+    /// artwork, not its empty edge, lines up with the picture.
+    static var cardAppBadgeSize: CGFloat { 32 * PreviewSizing.scale }
+    static var cardAppBadgeArtworkInset: CGFloat { (cardAppBadgeSize * 0.094).rounded() }
+
+    /// Stands in for the thumbnail when there is no capture, so it follows the
+    /// thumbnail rather than staying the one fixed picture on a scaling card.
+    static func cardFallbackIconSize(scale: CGFloat) -> CGFloat {
+        52 * scale
+    }
+
+    static var cardThumbnailWidth: CGFloat { cardThumbnailSize(scale: PreviewSizing.scale).width }
+    static var cardThumbnailHeight: CGFloat { cardThumbnailSize(scale: PreviewSizing.scale).height }
+    static var cardWidth: CGFloat { cardSize(scale: PreviewSizing.scale).width }
+    static var cardHeight: CGFloat {
+        cardSize(scale: PreviewSizing.scale,
+                 minimal: UserDefaults.standard.bool(forKey: DefaultsKey.minimalWindowPreviews)).height
+    }
+    static var cardFallbackIconSize: CGFloat { cardFallbackIconSize(scale: PreviewSizing.scale) }
 
     /// How solid the panel's frosted background is drawn, as a fraction. The
     /// floor is not zero on purpose: the panel's title sits straight on the
@@ -281,6 +410,10 @@ enum DockPreviewSupport {
     static func dockProximityBand(tileSize: CGFloat) -> CGFloat {
         max(160, tileSize * 1.5 + 60)
     }
+
+    /// Bounds expensive Accessibility hit testing independently of mouse
+    /// polling rate while remaining much faster than the hover delay.
+    static let mouseMoveSampleInterval: TimeInterval = 1.0 / 60
 
     static func availability(enabled: Bool,
                              hasAccessibility: Bool,
@@ -343,19 +476,138 @@ enum DockPreviewSupport {
         return CGRect(x: x, y: y, width: width, height: height)
     }
 
+    /// Pulls a preview back to the screen edge after an auto-hidden Dock slides
+    /// away. The other axis stays put so the panel does not jump away from the
+    /// app icon the user chose.
+    static func panelFrameWhenDockHidden(_ panelFrame: CGRect,
+                                         screenVisibleFrame: CGRect,
+                                         orientation: DockPreviewOrientation,
+                                         padding: CGFloat = edgePadding) -> CGRect {
+        var frame = panelFrame
+        switch orientation {
+        case .bottom:
+            frame.origin.y = screenVisibleFrame.minY + padding
+        case .left:
+            frame.origin.x = screenVisibleFrame.minX + padding
+        case .right:
+            frame.origin.x = screenVisibleFrame.maxX - panelFrame.width - padding
+        }
+        return frame
+    }
+
+    /// A panel already pulled into the space an auto-hidden Dock left keeps
+    /// that attachment when its cards change size. Rebuilding from the icon is
+    /// still useful for the new dimensions; only its Dock-facing axis is put
+    /// back at the screen edge.
+    static func resizedPanelFrame(_ dockAnchoredFrame: CGRect,
+                                  didReattachForSession: Bool,
+                                  screenVisibleFrame: CGRect,
+                                  orientation: DockPreviewOrientation) -> CGRect {
+        guard didReattachForSession else { return dockAnchoredFrame }
+        return panelFrameWhenDockHidden(dockAnchoredFrame,
+                                        screenVisibleFrame: screenVisibleFrame,
+                                        orientation: orientation)
+    }
+
+    /// The Dock window only needs watching until it disappears once. The
+    /// timer itself covers repeated mouse moves before that happens; the
+    /// session flag covers the moves after it has.
+    static func shouldStartDockVisibilityTimer(hasActiveTimer: Bool,
+                                               didReattachForSession: Bool,
+                                               autohide: Bool) -> Bool {
+        !hasActiveTimer && !didReattachForSession && autohide
+    }
+
+    /// Whether the panel draws a header row. A hovered panel has no use for
+    /// one: it named the app whose Dock icon the pointer is resting on, and
+    /// carried steppers for walking windows the pointer is already on top of.
+    /// A pinned panel keeps it -- there it is the drag handle, the only way to
+    /// unpin or close, and the only place that says which app it belongs to
+    /// once the pointer has gone.
+    static func showsPanelHeader(isPinned: Bool) -> Bool {
+        isPinned
+    }
+
+    /// The room the window's name has in the title band: the band less the two
+    /// controls beside it, whose place is held whether or not they are drawn.
+    static var cardTitleTextWidth: CGFloat { cardThumbnailWidth - 40 }
+
+    /// Whether a name is longer than the room it has. Measured against the font
+    /// it is drawn in rather than a layout pass, so the answer is the same
+    /// before the band has ever been on screen and can be checked without one.
+    /// Whether a card draws the app's icon in the corner of its picture. With
+    /// no capture the icon already fills the well as a watermark, so the badge
+    /// would only repeat it.
+    static func showsCardAppBadge(hasPreview: Bool) -> Bool {
+        hasPreview
+    }
+
+    /// Whether a card draws its close and minimize buttons. A pinned panel
+    /// counted as permanent hover, which held both open on every card it
+    /// showed for as long as it stayed up.
+    static func showsCardControls(isHovering: Bool, isSelected: Bool) -> Bool {
+        isHovering || isSelected
+    }
+
+    /// Cards run along the Dock's own edge. A Dock at the bottom gets a row; a
+    /// Dock at the side gets a column, because a row there grows away from the
+    /// Dock across the screen, which is the one direction the pointer is not
+    /// coming from. A pinned panel is detached from the Dock, so it keeps the
+    /// row at any Dock position.
+    static func stacksVertically(orientation: DockPreviewOrientation, isPinned: Bool) -> Bool {
+        !isPinned && (orientation == .left || orientation == .right)
+    }
+
+    /// How many cards the panel can show before it has to scroll.
+    static func visibleCardCount(itemCount: Int,
+                                 screenVisibleFrame: CGRect,
+                                 orientation: DockPreviewOrientation,
+                                 isPinned: Bool,
+                                 padding: CGFloat = panelPadding,
+                                 cardWidth: CGFloat = cardWidth,
+                                 cardHeight: CGFloat = cardHeight,
+                                 spacing: CGFloat = cardSpacing) -> Int {
+        let vertical = stacksVertically(orientation: orientation, isPinned: isPinned)
+        let cardExtent = vertical ? cardHeight : cardWidth
+        let screenExtent = vertical ? screenVisibleFrame.height : screenVisibleFrame.width
+        let maxExtent = max(cardExtent + padding * 2,
+                            min(screenExtent * 0.9, screenExtent - edgePadding * 2))
+        let available = max(1, Int((maxExtent - padding * 2 + spacing) / (cardExtent + spacing)))
+        return min(max(1, itemCount), available)
+    }
+
     static func panelSize(itemCount: Int,
                           screenVisibleFrame: CGRect,
+                          isPinned: Bool,
+                          orientation: DockPreviewOrientation = .bottom,
                           padding: CGFloat = panelPadding,
                           cardWidth: CGFloat = cardWidth,
                           cardHeight: CGFloat = cardHeight,
                           spacing: CGFloat = cardSpacing) -> CGSize {
         let count = max(1, itemCount)
+        let vertical = stacksVertically(orientation: orientation, isPinned: isPinned)
+        let visibleCards = visibleCardCount(itemCount: count,
+                                            screenVisibleFrame: screenVisibleFrame,
+                                            orientation: orientation,
+                                            isPinned: isPinned,
+                                            padding: padding,
+                                            cardWidth: cardWidth,
+                                            cardHeight: cardHeight,
+                                            spacing: spacing)
+        let run = CGFloat(visibleCards) * (vertical ? cardHeight : cardWidth)
+            + CGFloat(max(0, visibleCards - 1)) * spacing + padding * 2
+        let header = showsPanelHeader(isPinned: isPinned) ? panelHeaderHeight : 0
+        if vertical {
+            let maxHeight = max(cardHeight + padding * 2,
+                                min(screenVisibleFrame.height * 0.9,
+                                    screenVisibleFrame.height - edgePadding * 2))
+            return CGSize(width: cardWidth + padding * 2,
+                          height: min(run + header, maxHeight + header))
+        }
         let maxWidth = max(cardWidth + padding * 2,
-                           min(screenVisibleFrame.width * 0.9, screenVisibleFrame.width - edgePadding * 2))
-        let availableCards = max(1, Int((maxWidth - padding * 2 + spacing) / (cardWidth + spacing)))
-        let visibleCards = min(count, availableCards)
-        let width = CGFloat(visibleCards) * cardWidth + CGFloat(max(0, visibleCards - 1)) * spacing + padding * 2
-        return CGSize(width: min(width, maxWidth), height: cardHeight + padding * 2 + panelHeaderHeight)
+                           min(screenVisibleFrame.width * 0.9,
+                               screenVisibleFrame.width - edgePadding * 2))
+        return CGSize(width: min(run, maxWidth), height: cardHeight + padding * 2 + header)
     }
 
     static func windowPositionText(selectedWindowID: CGWindowID?, windowIDs: [CGWindowID]) -> String? {

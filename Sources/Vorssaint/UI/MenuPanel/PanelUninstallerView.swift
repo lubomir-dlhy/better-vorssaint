@@ -10,9 +10,10 @@ struct PanelUninstallerView: View {
     @ObservedObject private var permissions = Permissions.shared
     @ObservedObject private var uninstaller = AppUninstaller.shared
     @ObservedObject private var homebrew = HomebrewManager.shared
+    @Environment(\.notchPresentation) private var inNotch
     @State private var dropTargeted = false
     @State private var showingAppPicker = false
-    @State private var pendingHomebrewRemoval: HomebrewPackage?
+    @State private var pendingHomebrewRemoval: AppUninstaller.HomebrewRemovalConfirmation?
     @State private var showHomebrewDetails = false
 
     var onClose: () -> Void
@@ -29,19 +30,23 @@ struct PanelUninstallerView: View {
             }
             return selected
         } isTargeted: { dropTargeted = $0 }
-        .onAppear { PanelInteractionState.shared.keepsPopoverOpen = true }
-        .onDisappear { PanelInteractionState.shared.keepsPopoverOpen = false }
+        .onAppear { PanelInteractionState.shared.viewKeepsPopoverOpen = true }
+        .onDisappear {
+            PanelInteractionState.shared.viewKeepsPopoverOpen = false
+            dismissHomebrewRemovalConfirmation()
+        }
         .alert(l10n.s.homebrewConfirmUninstallTitle,
-               isPresented: Binding(get: { pendingHomebrewRemoval != nil },
-                                    set: { if !$0 { pendingHomebrewRemoval = nil } }),
-               presenting: pendingHomebrewRemoval) { package in
-            Button(l10n.s.uninstallerCancel, role: .cancel) {}
-            Button(l10n.s.homebrewUninstall, role: .destructive) {
-                pendingHomebrewRemoval = nil
-                uninstaller.removeSelectedWithHomebrew()
+               isPresented: homebrewRemovalConfirmationPresented,
+               presenting: pendingHomebrewRemoval) { confirmation in
+            Button(l10n.s.uninstallerCancel, role: .cancel) {
+                dismissHomebrewRemovalConfirmation()
             }
-        } message: { package in
-            Text(String(format: l10n.s.homebrewConfirmUninstallBodyFormat, package.displayName))
+            Button(l10n.s.homebrewUninstall, role: .destructive) {
+                uninstaller.removeSelectedWithHomebrew(confirmation: confirmation)
+                dismissHomebrewRemovalConfirmation()
+            }
+        } message: { confirmation in
+            Text(String(format: l10n.s.homebrewConfirmUninstallBodyFormat, confirmation.package.displayName))
         }
     }
 
@@ -66,7 +71,12 @@ struct PanelUninstallerView: View {
             Label(l10n.s.uninstallerName, systemImage: "trash")
                 .font(.system(size: 12, weight: .semibold))
             Spacer()
-            Button(action: onClose) {
+            Button {
+                // Closing means cancel: a scan left running would come back
+                // on the next open. A removal in progress is left alone.
+                if uninstaller.phase == .scanning { uninstaller.reset() }
+                onClose()
+            } label: {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 14))
                     .foregroundStyle(.secondary)
@@ -155,6 +165,10 @@ struct PanelUninstallerView: View {
                         .font(.system(size: 11.5, weight: .medium))
                         .lineLimit(1)
                 }
+            }
+            if uninstaller.phase == .scanning {
+                Button(l10n.s.uninstallerCancel) { uninstaller.reset() }
+                    .controlSize(.small)
             }
         }
         .frame(maxWidth: .infinity)
@@ -246,13 +260,29 @@ struct PanelUninstallerView: View {
                     .font(.system(size: 11))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(prettyPath(item.url))
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.head)
+                HStack(spacing: 4) {
+                    if item.confidence == .related {
+                        Image(systemName: "questionmark.circle")
+                            .foregroundStyle(.orange)
+                            .help(l10n.s.cleanerOptionalSection)
+                            .accessibilityLabel(l10n.s.cleanerOptionalSection)
+                    }
+                    Text(prettyPath(item.url))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+                .font(.system(size: 9.5))
             }
             Spacer(minLength: 0)
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([item.url])
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.plain)
+            .help(l10n.s.cleanerRevealInFinder)
+            .accessibilityLabel(l10n.s.cleanerRevealInFinder)
             Text(Self.byteString(item.size))
                 .font(.system(size: 10))
                 .monospacedDigit()
@@ -281,8 +311,8 @@ struct PanelUninstallerView: View {
                 .disabled(uninstaller.isRemovingWithHomebrew)
                 Spacer()
                 Button {
-                    if let package = uninstaller.selectedHomebrewPackage {
-                        pendingHomebrewRemoval = package
+                    if let confirmation = uninstaller.homebrewRemovalConfirmation {
+                        presentHomebrewRemovalConfirmation(confirmation)
                     } else {
                         uninstaller.removeSelected()
                     }
@@ -302,6 +332,36 @@ struct PanelUninstallerView: View {
 
     private var removeButtonTitle: String {
         uninstaller.selectedHomebrewPackage == nil ? l10n.s.uninstallerRemove : l10n.s.homebrewUninstall
+    }
+
+    private var homebrewRemovalConfirmationPresented: Binding<Bool> {
+        Binding {
+            pendingHomebrewRemoval != nil
+        } set: { isPresented in
+            if !isPresented { dismissHomebrewRemovalConfirmation() }
+        }
+    }
+
+    private func presentHomebrewRemovalConfirmation(_ confirmation: AppUninstaller.HomebrewRemovalConfirmation) {
+        // The alert would hang from the island as a sheet; there it asks on its own.
+        guard !inNotch else {
+            DispatchQueue.main.async {
+                guard NSAlert.confirmAboveIsland(l10n.s.homebrewConfirmUninstallTitle,
+                                                 message: String(format: l10n.s.homebrewConfirmUninstallBodyFormat,
+                                                                 confirmation.package.displayName),
+                                                 action: l10n.s.homebrewUninstall, destructive: true,
+                                                 cancel: l10n.s.uninstallerCancel) else { return }
+                uninstaller.removeSelectedWithHomebrew(confirmation: confirmation)
+            }
+            return
+        }
+        PanelInteractionState.shared.isPresentingPopoverModal = true
+        pendingHomebrewRemoval = confirmation
+    }
+
+    private func dismissHomebrewRemovalConfirmation() {
+        pendingHomebrewRemoval = nil
+        PanelInteractionState.shared.isPresentingPopoverModal = false
     }
 
     @ViewBuilder
@@ -338,22 +398,18 @@ struct PanelUninstallerView: View {
         }
     }
 
-    private func doneState(freed: Int64, failed: Int) -> some View {
+    private func doneState(freed: Int64, failed: [AppUninstaller.Leftover]) -> some View {
         VStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
+            Image(systemName: UninstallerSupport.doneSymbol(hasLeftovers: !failed.isEmpty))
                 .font(.system(size: 32))
-                .foregroundStyle(.green)
+                .foregroundStyle(failed.isEmpty ? .green : .orange)
             Text(l10n.s.uninstallerDoneTitle)
                 .font(.system(size: 14, weight: .bold))
             Text(String(format: l10n.s.uninstallerFreedFormat, Self.byteString(freed)))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-            if failed > 0 {
-                Text(l10n.s.uninstallerSomeFailed)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
+            if !failed.isEmpty {
+                UninstallFailureNote(items: failed, compact: true)
             }
             Button(l10n.s.uninstallerAnother) {
                 uninstaller.reset()

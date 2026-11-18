@@ -334,6 +334,7 @@ private final class FanControlController {
 
     private func updateActiveConfiguration(_ configuration: FanControlConfiguration,
                                            duration: TimeInterval?) -> FanControlResponse {
+        if hardware == nil { hardware = FanControlHardware() }
         guard let hardware,
               let request = try? hardware.coolingRequest(for: configuration) else {
             return .failure(.controlFailed, snapshot: currentSnapshot())

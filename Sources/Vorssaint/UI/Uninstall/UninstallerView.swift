@@ -11,9 +11,10 @@ struct UninstallerView: View {
     @ObservedObject private var uninstaller = AppUninstaller.shared
     @ObservedObject private var homebrew = HomebrewManager.shared
     @ObservedObject private var permissions = Permissions.shared
+    @AppStorage(DefaultsKey.uninstallerCommandBarEnabled) private var commandBarEnabled = false
     @State private var dropTargeted = false
     @State private var showingAppPicker = false
-    @State private var pendingHomebrewRemoval: HomebrewPackage?
+    @State private var pendingHomebrewRemoval: AppUninstaller.HomebrewRemovalConfirmation?
     @State private var showHomebrewDetails = false
 
     var body: some View {
@@ -22,14 +23,14 @@ struct UninstallerView: View {
             .alert(l10n.s.homebrewConfirmUninstallTitle,
                    isPresented: Binding(get: { pendingHomebrewRemoval != nil },
                                         set: { if !$0 { pendingHomebrewRemoval = nil } }),
-                   presenting: pendingHomebrewRemoval) { package in
+                   presenting: pendingHomebrewRemoval) { confirmation in
                 Button(l10n.s.uninstallerCancel, role: .cancel) {}
                 Button(l10n.s.homebrewUninstall, role: .destructive) {
                     pendingHomebrewRemoval = nil
-                    uninstaller.removeSelectedWithHomebrew()
+                    uninstaller.removeSelectedWithHomebrew(confirmation: confirmation)
                 }
-            } message: { package in
-                Text(String(format: l10n.s.homebrewConfirmUninstallBodyFormat, package.displayName))
+            } message: { confirmation in
+                Text(String(format: l10n.s.homebrewConfirmUninstallBodyFormat, confirmation.package.displayName))
             }
     }
 
@@ -45,6 +46,20 @@ struct UninstallerView: View {
     }
 
     // MARK: Empty / drop
+
+    private var commandBarToggle: some View {
+        Form {
+            Section {
+                Toggle(l10n.s.uninstallerCommandBarToggle, isOn: $commandBarEnabled)
+                Text(l10n.s.uninstallerCommandBarCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 360)
+    }
 
     private var emptyState: some View {
         VStack(spacing: 20) {
@@ -77,6 +92,8 @@ struct UninstallerView: View {
             Text(l10n.s.uninstallerEmptyNote)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
+
+            commandBarToggle
 
             if !permissions.fullDiskAccess {
                 FullDiskAccessNote().frame(width: 360)
@@ -111,6 +128,10 @@ struct UninstallerView: View {
                     Image(nsImage: target.icon).resizable().frame(width: 18, height: 18)
                     Text(target.name).font(.callout)
                 }
+            }
+            if uninstaller.phase == .scanning {
+                Button(l10n.s.uninstallerCancel) { uninstaller.reset() }
+                    .controlSize(.large)
             }
             Spacer()
         }
@@ -172,11 +193,27 @@ struct UninstallerView: View {
                 .resizable().frame(width: 22, height: 22)
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.name).font(.system(size: 12.5)).lineLimit(1).truncationMode(.middle)
-                Text(prettyPath(item.url))
-                    .font(.system(size: 10.5)).foregroundStyle(.tertiary)
-                    .lineLimit(1).truncationMode(.head)
+                HStack(spacing: 5) {
+                    if item.confidence == .related {
+                        Label(l10n.s.cleanerOptionalSection, systemImage: "questionmark.circle")
+                            .foregroundStyle(.orange)
+                    }
+                    Text(prettyPath(item.url))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+                .font(.system(size: 10.5))
             }
             Spacer()
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([item.url])
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.plain)
+            .help(l10n.s.cleanerRevealInFinder)
+            .accessibilityLabel(l10n.s.cleanerRevealInFinder)
             Text(Self.byteString(item.size))
                 .font(.system(size: 11.5)).foregroundStyle(.secondary)
                 .monospacedDigit()
@@ -197,8 +234,8 @@ struct UninstallerView: View {
             Button(l10n.s.uninstallerCancel) { uninstaller.reset() }
                 .disabled(uninstaller.isRemovingWithHomebrew)
             Button(removeButtonTitle) {
-                if let package = uninstaller.selectedHomebrewPackage {
-                    pendingHomebrewRemoval = package
+                if let confirmation = uninstaller.homebrewRemovalConfirmation {
+                    pendingHomebrewRemoval = confirmation
                 } else {
                     uninstaller.removeSelected()
                 }
@@ -256,20 +293,17 @@ struct UninstallerView: View {
 
     // MARK: Done
 
-    private func doneState(freed: Int64, failed: Int) -> some View {
+    private func doneState(freed: Int64, failed: [AppUninstaller.Leftover]) -> some View {
         VStack(spacing: 16) {
             Spacer()
-            Image(systemName: "checkmark.circle.fill")
+            Image(systemName: UninstallerSupport.doneSymbol(hasLeftovers: !failed.isEmpty))
                 .font(.system(size: 54))
-                .foregroundStyle(.green)
+                .foregroundStyle(failed.isEmpty ? .green : .orange)
             Text(l10n.s.uninstallerDoneTitle).font(.system(size: 20, weight: .bold))
             Text(String(format: l10n.s.uninstallerFreedFormat, Self.byteString(freed)))
                 .font(.system(size: 13)).foregroundStyle(.secondary)
-            if failed > 0 {
-                Text(l10n.s.uninstallerSomeFailed)
-                    .font(.caption).foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 40)
+            if !failed.isEmpty {
+                UninstallFailureNote(items: failed).frame(width: 360)
             }
             Button(l10n.s.uninstallerAnother) { uninstaller.reset() }
                 .controlSize(.large)

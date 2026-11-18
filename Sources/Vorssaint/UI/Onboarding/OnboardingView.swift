@@ -237,7 +237,7 @@ private struct PurposeStep: View {
                     .tracking(1)
                 Spacer()
                 Text(String(format: hub.activeCountFormat,
-                            selectedFeatures.count, AppFeature.allCases.count))
+                            selectedFeatures.count, FeatureRuntime.shared.installableCount))
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -333,12 +333,20 @@ private struct PurposeStep: View {
 
     private func featureCard(_ feature: AppFeature) -> some View {
         let selected = selectedFeatures.contains(feature)
-        return Button {
+        // The picker writes availability through the same runtime gate as the
+        // hub, so a feature this Mac cannot run would silently stay off after
+        // being ticked here. It is shown and refused instead, exactly as the
+        // hub row does it.
+        let blocked = feature.installBlockedReason
+        let card = Button {
             selectedPreset = nil
             if selected {
                 selectedFeatures.remove(feature)
+                if feature == .notch {
+                    selectedFeatures.subtract(AppFeature.dynamicIslandExtensions)
+                }
             } else {
-                selectedFeatures.insert(feature)
+                selectedFeatures.formUnion(feature.initialInstallGroup)
             }
         } label: {
             HStack(spacing: 10) {
@@ -378,8 +386,15 @@ private struct PurposeStep: View {
             .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(feature.hubTitle(l10n.s, hub: hub)). \(feature.hubDescription(hub))")
+        .disabled(blocked != nil)
+        .opacity(blocked == nil ? 1 : 0.4)
+        .saturation(blocked == nil ? 1 : 0)
+        .accessibilityLabel("\(feature.hubTitle(l10n.s, hub: hub)). \(feature.hubDescription(hub))"
+                            + (blocked.map { ". \($0)" } ?? ""))
         .accessibilityAddTraits(selected ? .isSelected : [])
+        // .help() never fires on a disabled control, so the tooltip sits on a
+        // wrapper outside it, the same way the Features hub row does it.
+        return HStack(spacing: 0) { card }.help(blocked ?? "")
     }
 
     private func groupTitle(_ group: FeatureGroup) -> String {
@@ -390,6 +405,7 @@ private struct PurposeStep: View {
         case .sound: return hub.groupSound
         case .energyDisplay: return hub.groupEnergyDisplay
         case .tools: return hub.groupTools
+        case .dynamicIsland: return FeatureStrings.notch(l10n.language).title
         case .monitor: return hub.groupMonitor
         }
     }
@@ -482,7 +498,10 @@ private struct SelectedPermissionsStep: View {
         features
             .filter { $0.onboardingPermissions.contains(permission) }
             .map { $0.hubTitle(l10n.s, hub: hub) }
-            .sorted()
+            // Localized: a plain sort orders by Unicode scalar, which throws
+            // every accented name past Z. On the first screen someone sees,
+            // in a language with accents, that reads as a list in no order.
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
             .joined(separator: ", ")
     }
 }

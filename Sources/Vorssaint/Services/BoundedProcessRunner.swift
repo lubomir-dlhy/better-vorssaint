@@ -27,6 +27,43 @@ private final class BoundedProcessOutput: @unchecked Sendable {
     }
 }
 
+/// Cancellation owns one process launch; the lock closes the gap between
+/// cancelling a queued request and that request launching its child.
+final class BoundedProcessCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var process: Process?
+
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled else { lock.unlock(); return }
+        cancelled = true
+        let child = process
+        lock.unlock()
+        guard let child, child.isRunning else { return }
+        child.terminate()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
+            if child.isRunning { kill(child.processIdentifier, SIGKILL) }
+        }
+    }
+
+    fileprivate func launch(_ child: Process) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled, process == nil else { throw CancellationError() }
+        try child.run()
+        process = child
+    }
+
+    fileprivate func release(_ child: Process) {
+        lock.lock()
+        defer { lock.unlock() }
+        if process === child { process = nil }
+    }
+}
+
 enum BoundedProcessRunner {
     struct Result {
         let status: Int32
@@ -37,7 +74,8 @@ enum BoundedProcessRunner {
     static func run(_ path: String,
                     _ arguments: [String],
                     timeout: TimeInterval,
-                    maxOutputBytes: Int) -> Result {
+                    maxOutputBytes: Int,
+                    cancellation: BoundedProcessCancellation? = nil) -> Result {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -59,18 +97,26 @@ enum BoundedProcessRunner {
             }
         }
 
+        // The child is watched through its termination handler. A blocking
+        // `waitUntilExit()` has to be parked on a thread of its own, and the
+        // timeout below makes `run` walk away from it while it still holds one
+        // worker of the shared 64-thread pool. Those abandoned waits pile up
+        // faster than they drain, and a full pool starves every later user of
+        // it, the main thread's window walk included (issue #971). It also
+        // starves this runner, which then reports timeouts for commands that
+        // exited at once and abandons another wait doing it. A termination
+        // handler occupies no thread, so none of that accumulates.
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+
+        defer { cancellation?.release(process) }
         do {
-            try process.run()
+            if let cancellation { try cancellation.launch(process) }
+            else { try process.run() }
         } catch {
             reader.readabilityHandler = nil
             try? reader.close()
             return Result(status: -1, output: Data(), timedOut: false)
-        }
-
-        let finished = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .utility).async {
-            process.waitUntilExit()
-            finished.signal()
         }
 
         var didFinish = finished.wait(timeout: .now() + max(0, timeout)) == .success
