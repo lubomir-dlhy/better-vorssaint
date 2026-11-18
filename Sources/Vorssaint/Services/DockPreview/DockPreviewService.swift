@@ -1185,15 +1185,15 @@ final class DockPreviewService: ObservableObject {
               let dockPID = dockProcessID()
         else { return nil }
 
-        var rawElement: AXUIElement?
-        // Resolve only after finding a visible Dock, and reuse the answer
-        // when a pass-through overlay made the ownership check ask first.
-        func hitElement() -> AXUIElement? {
-            if let rawElement { return rawElement }
+        // Asked only when a pass-through overlay covers the Dock, since only
+        // the system-wide element can tell whose it is. Its answer is reused
+        // when it turns out to be the Dock's.
+        var overlayHit: AXUIElement?
+        func systemWideHitProcessID() -> pid_t? {
             guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),
                                                    Float(axPoint.x), Float(axPoint.y),
-                                                   &rawElement) == .success else { return nil }
-            return rawElement
+                                                   &overlayHit) == .success else { return nil }
+            return overlayHit.flatMap { pid(of: $0) }
         }
 
         guard DockClickSupport.dockOwnsPoint(
@@ -1202,47 +1202,86 @@ final class DockPreviewService: ObservableObject {
             dockProcessID: dockPID,
             dockLayer: Int(CGWindowLevelForKey(.dockWindow)),
             ownProcessID: getpid(),
-            accessibilityHitProcessID: { hitElement().flatMap { self.pid(of: $0) } }
-        ), let element = hitElement() else { return nil }
+            accessibilityHitProcessID: systemWideHitProcessID
+        ), let element = overlayHit ?? dockElement(at: axPoint, dockPID: dockPID) else { return nil }
 
-        for candidate in elementAndParents(from: element) {
-            guard pid(of: candidate) == dockPID,
-                  let frame = appKitFrame(of: candidate),
-                  let resolution = runningApplication(forDockElement: candidate)
+        // Resolving by bundle comes first, for the whole chain. Only a tile
+        // names a process, while the labels below read the same across the
+        // tiles of an app that runs as several processes: letting a label match
+        // answer first would collapse those tiles onto one instance and, by
+        // returning here, keep the tile itself from ever being asked. Taking
+        // the frame from the element that resolved also pins the panel to the
+        // icon rather than to whatever sat under the pointer inside it.
+        let chain = elementAndParents(from: element).filter { pid(of: $0) == dockPID }
+        for candidate in chain {
+            if let shortcut = parallShortcutResolution(forDockElement: candidate),
+               let frame = appKitFrame(of: candidate) {
+                return DockHit(app: shortcut.app, iconFrame: frame, preferences: preferences,
+                               displayName: shortcut.displayName, icon: shortcut.icon)
+            }
+            switch DockTileResolver.resolution(forTile: candidate) {
+            case .instance(let app):
+                guard let frame = appKitFrame(of: candidate) else { continue }
+                return DockHit(app: app, iconFrame: frame, preferences: preferences)
+            case .unpaired:
+                return nil
+            case .unknown:
+                continue
+            }
+        }
+        for candidate in chain {
+            guard let frame = appKitFrame(of: candidate),
+                  let app = applicationByLabel(forDockElement: candidate)
             else { continue }
-            return DockHit(app: resolution.app,
-                           iconFrame: frame,
-                           preferences: preferences,
-                           displayName: resolution.displayName,
-                           icon: resolution.icon)
+            return DockHit(app: app, iconFrame: frame, preferences: preferences)
         }
         return nil
     }
 
-    private func runningApplication(forDockElement element: AXUIElement) -> DockApplicationResolution? {
+    /// The Dock element under the pointer, asked of the Dock alone. The
+    /// system-wide element would ask whichever app owns the window there, and
+    /// the Dock strip's ownership margin reaches over the windows beside it,
+    /// so a hung app next to the Dock stalled the main thread on every move
+    /// until Accessibility gave up on it (issue #3208).
+    private func dockElement(at axPoint: CGPoint, dockPID: pid_t) -> AXUIElement? {
+        let dock = AXUIElementCreateApplication(dockPID)
+        AXUIElementSetMessagingTimeout(dock, DockPreviewSupport.dockHitTimeout)
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(dock, Float(axPoint.x), Float(axPoint.y),
+                                               &element) == .success else { return nil }
+        return element
+    }
+
+    private func parallShortcutResolution(forDockElement element: AXUIElement) -> DockApplicationResolution? {
+        guard let url = urlAttribute(element),
+              let shortcutBundle = Bundle(url: url),
+              let target = ParallShortcutResolver.targetApplication(for: shortcutBundle) else { return nil }
+        return DockApplicationResolution(
+            app: target,
+            displayName: url.deletingPathExtension().lastPathComponent,
+            icon: NSWorkspace.shared.icon(forFile: url.path)
+        )
+    }
+
+    private func urlAttribute(_ element: AXUIElement) -> URL? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value) == .success,
+              let value
+        else { return nil }
+        return value as? URL
+    }
+
+    /// Last resort for a Dock element whose chain named no bundle at all, or
+    /// named one no running app owns. Labels cannot tell two processes of one
+    /// app apart, so this only ever runs where there is nothing to tell apart.
+    private func applicationByLabel(forDockElement element: AXUIElement) -> NSRunningApplication? {
+        let labels = labelCandidates(from: element)
+        guard !labels.isEmpty else { return nil }
         let running = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular
                 && !$0.isTerminated
                 && !ParallShortcutResolver.isLaunchedByShortcut($0)
         }
-
-        if let url = urlAttribute(element) {
-            if let shortcutBundle = Bundle(url: url),
-               let target = ParallShortcutResolver.targetApplication(for: shortcutBundle) {
-                return DockApplicationResolution(
-                    app: target,
-                    displayName: url.deletingPathExtension().lastPathComponent,
-                    icon: NSWorkspace.shared.icon(forFile: url.path)
-                )
-            }
-            let standardized = url.standardizedFileURL.path
-            if let app = running.first(where: { $0.bundleURL?.standardizedFileURL.path == standardized }) {
-                return DockApplicationResolution(app: app)
-            }
-        }
-
-        let labels = labelCandidates(from: element)
-        guard !labels.isEmpty else { return nil }
         return running.first { app in
             let names = [
                 app.localizedName,
@@ -1250,7 +1289,7 @@ final class DockPreviewService: ObservableObject {
                 app.bundleURL?.lastPathComponent.replacingOccurrences(of: ".app", with: ""),
             ].compactMap { $0 }.map(normalizeLabel)
             return labels.contains { label in names.contains(normalizeLabel(label)) }
-        }.map { DockApplicationResolution(app: $0) }
+        }
     }
 
     private func labelCandidates(from element: AXUIElement) -> [String] {
@@ -1415,14 +1454,6 @@ final class DockPreviewService: ObservableObject {
         return value as? String
     }
 
-    private func urlAttribute(_ element: AXUIElement) -> URL? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value) == .success,
-              let value
-        else { return nil }
-        return value as? URL
-    }
-
     private func normalizeLabel(_ value: String) -> String {
         let firstLine = value.components(separatedBy: .newlines).first ?? value
         return firstLine
@@ -1458,8 +1489,8 @@ private struct DockHit {
     let app: NSRunningApplication
     let iconFrame: CGRect
     let preferences: DockPreviewPreferences
-    let displayName: String?
-    let icon: NSImage?
+    var displayName: String? = nil
+    var icon: NSImage? = nil
 }
 
 private struct DockApplicationResolution {
