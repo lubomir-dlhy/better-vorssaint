@@ -133,18 +133,13 @@ enum Sudoers {
         "/etc/sudoers.d/vorss-clamshell",
     ]
 
-    private static var safeUser: String? {
-        let user = NSUserName()
-        let valid = user.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil
-        return valid ? user : nil
-    }
-
-    /// Serializes every touch of the SleepDisabled state. The probe below
-    /// re-applies the value it just read; racing it against a concurrent
-    /// disable (launch recovery, a session ending) could resurrect a stale
-    /// "1" after the flag was already cleared, leaving lid sleep off with
-    /// nothing left to repair it.
+    /// Serializes native writes and read/reapply probes. Authorization runs
+    /// separately with probes suspended, so a probe cannot resurrect a stale
+    /// "1" after a restore cleared it and leave lid sleep off without a marker.
     private static let sleepStateQueue = DispatchQueue(label: "com.vorssaint.utils.pmset-state")
+    // Authorization runs outside this queue so quitting never waits for a
+    // password prompt. Probes must not reapply a stale state during that off.
+    private static var sleepStateProbeSuspensions = 0
 
     /// Proves the passwordless path by running it: re-applying the current
     /// SleepDisabled state through `sudo -n` changes nothing on the system and
@@ -153,6 +148,7 @@ enum Sudoers {
     /// a password, which put every toggle behind a prompt (issue #269).
     static func isConfigured() -> Bool {
         sleepStateQueue.sync {
+            guard sleepStateProbeSuspensions == 0 else { return false }
             let report = Shell.run("/usr/bin/pmset", ["-g"])
             guard report.status == 0 else { return false }
             return pmsetDisableSleepOnQueue(SudoersSupport.sleepDisabled(inPmsetOutput: report.output))
@@ -167,11 +163,10 @@ enum Sudoers {
     }
 
     static func install(completion: @escaping (Bool) -> Void) {
-        guard let user = safeUser else {
-            completion(false)
-            return
-        }
-        let rule = "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset disablesleep 1, /usr/bin/pmset disablesleep 0"
+        // Granted by uid, not username: a short name is free-form text on
+        // SSO-enrolled Macs (name@company.com, #915) and the old validation
+        // rejected it before the password prompt could even appear.
+        let rule = SudoersSupport.clamshellRule(uid: getuid())
         // Clear any earlier-named rule first, then write and validate the new one
         // (a failed check rolls back). Same password prompt either way.
         let legacy = legacyRulePaths.joined(separator: " ")
@@ -195,6 +190,45 @@ enum Sudoers {
     @discardableResult
     static func pmsetDisableSleep(_ on: Bool) -> Bool {
         sleepStateQueue.sync { pmsetDisableSleepOnQueue(on) }
+    }
+
+    /// Queues asynchronous writes directly in request order. Completions
+    /// must not wait for the main thread or for administrator authorization.
+    static func pmsetDisableSleep(_ on: Bool, completion: @escaping (Bool) -> Void) {
+        sleepStateQueue.async {
+            completion(pmsetDisableSleepOnQueue(on))
+        }
+    }
+
+    /// Completes earlier probes before authorization can restore sleep and
+    /// suspends later probes until it finishes. The queue remains free for a
+    /// silent restore during quit; the main-thread guard cancels stale prompts.
+    static func restoreSleepWithAuthorization(prompt: String,
+                                              shouldProceed: @escaping () -> Bool,
+                                              completion: @escaping (Bool) -> Void) {
+        sleepStateQueue.async {
+            sleepStateProbeSuspensions += 1
+            let finish: (Bool) -> Void = { ok in
+                sleepStateQueue.async {
+                    sleepStateProbeSuspensions -= 1
+                    completion(ok)
+                }
+            }
+            // A failed enable may never have set the override. Once probes
+            // are suspended, a confirmed off needs no further authorization.
+            let report = Shell.run("/usr/bin/pmset", ["-g"])
+            if report.status == 0, !SudoersSupport.sleepDisabled(inPmsetOutput: report.output) {
+                finish(true)
+                return
+            }
+            DispatchQueue.main.async {
+                guard shouldProceed() else {
+                    finish(false)
+                    return
+                }
+                AdminShell.run("pmset disablesleep 0", prompt: prompt, completion: finish)
+            }
+        }
     }
 
     private static func pmsetDisableSleepOnQueue(_ on: Bool) -> Bool {

@@ -3,6 +3,7 @@
 
 import Darwin
 import Foundation
+import SystemConfiguration
 
 /// One network reading: instantaneous speed plus session totals.
 struct NetworkReading {
@@ -21,14 +22,14 @@ final class NetworkSampler {
     private var totalUp: UInt64 = 0
     private var counterFallback = NetworkCounterFallback()
     private var processDeltaTracker = NetworkProcessDeltaTracker(maxGap: 30)
-    private let counterReader: () -> NetworkCounters
+    private let counterReader: () -> NetworkCounters?
     private let processReader: () -> [NetworkProcessSample]?
 
     /// After a gap longer than this (sampling was paused), the previous reading
     /// is treated as a fresh baseline instead of producing a misleading spike.
     private static let maxGap: TimeInterval = 10
 
-    init(counterReader: @escaping () -> NetworkCounters = NetworkSampler.readCounters,
+    init(counterReader: @escaping () -> NetworkCounters? = NetworkSampler.readCounters,
          processReader: @escaping () -> [NetworkProcessSample]? = {
              NetworkProcessSupport.currentExternalActivitySamples()
          }) {
@@ -37,10 +38,16 @@ final class NetworkSampler {
     }
 
     func sample(now: TimeInterval) -> NetworkReading {
-        let counters = counterReader()
+        guard let counters = counterReader() else {
+            return NetworkReading(downBytesPerSec: nil, upBytesPerSec: nil,
+                                  totalDown: totalDown, totalUp: totalUp)
+        }
         defer { previous = (counters, now) }
 
-        guard let prev = previous, now > prev.time, now - prev.time <= Self.maxGap else {
+        guard let prev = previous, now > prev.time, now - prev.time <= Self.maxGap,
+              prev.counters.interfaces == counters.interfaces else {
+            counterFallback.reset()
+            processDeltaTracker.reset()
             return NetworkReading(downBytesPerSec: nil, upBytesPerSec: nil,
                                   totalDown: totalDown, totalUp: totalUp)
         }
@@ -90,19 +97,19 @@ final class NetworkSampler {
     /// Sums received/sent bytes across the physical interfaces via the routing
     /// socket (`NET_RT_IFLIST2`), which reports 64-bit counters in `if_data64` —
     /// unlike `getifaddrs`, whose 32-bit counters wrap and corrupt totals.
-    static func readCounters() -> NetworkCounters {
+    static func readCounters() -> NetworkCounters? {
         var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
         var length = 0
         guard sysctl(&mib, 6, nil, &length, nil, 0) == 0, length > 0 else {
-            return NetworkCounters()
+            return nil
         }
 
         var buffer = [UInt8](repeating: 0, count: length)
         guard sysctl(&mib, 6, &buffer, &length, nil, 0) == 0 else {
-            return NetworkCounters()
+            return nil
         }
 
-        var result = NetworkCounters()
+        var perInterface: [String: (received: UInt64, sent: UInt64)] = [:]
         buffer.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var offset = 0
@@ -120,15 +127,30 @@ final class NetworkSampler {
                     var nameBuffer = [CChar](repeating: 0, count: Int(IFNAMSIZ))
                     if if_indextoname(UInt32(info.ifm_index), &nameBuffer) != nil {
                         let name = String(cString: nameBuffer)
-                        if MetricFormat.includeNetworkInterface(name) {
-                            result.received += info.ifm_data.ifi_ibytes
-                            result.sent += info.ifm_data.ifi_obytes
-                        }
+                        perInterface[name] = (info.ifm_data.ifi_ibytes, info.ifm_data.ifi_obytes)
                     }
                 }
                 offset += messageLength
             }
         }
+        var result = NetworkCounters()
+        result.interfaces = MetricFormat.countedNetworkInterfaces(Array(perInterface.keys),
+                                                                  primaries: primaryInterfaces())
+        for name in result.interfaces {
+            guard let counters = perInterface[name] else { continue }
+            result.received += counters.received
+            result.sent += counters.sent
+        }
         return result
+    }
+
+    private static let store = SCDynamicStoreCreate(nil, "com.vorssaint.utils.network-sampler" as CFString, nil, nil)
+
+    /// The interfaces the system routes IPv4 and IPv6 through.
+    private static func primaryInterfaces() -> [String] {
+        guard let store else { return [] }
+        return ["State:/Network/Global/IPv4", "State:/Network/Global/IPv6"].compactMap { key in
+            (SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any])?["PrimaryInterface"] as? String
+        }
     }
 }

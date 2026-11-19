@@ -8,6 +8,9 @@ import Foundation
 struct NetworkCounters: Equatable {
     var received: UInt64 = 0
     var sent: UInt64 = 0
+    /// The interfaces summed. Another set reads as other counters, so a
+    /// change of connection never shows as a burst of traffic.
+    var interfaces: Set<String> = []
 }
 
 /// Detects the macOS failure mode where outbound interface counters keep moving
@@ -66,24 +69,36 @@ struct DiskIOCounters: Equatable {
 /// Everything here depends only on Foundation — no IOKit, no AppKit, no UI — so
 /// it compiles and runs standalone in the unit-test target (`./build.sh --test`).
 enum MetricFormat {
+    /// Numbers follow the reader's region, not the app's language: macOS keeps
+    /// those two settings apart, and nine of the fifteen languages here are
+    /// spoken where a decimal is written with a comma. Held in one place so a
+    /// test can pin it and stay honest on a machine set to any region.
+    static var locale: Locale = .current
+
     // MARK: Memory
 
-    /// Matches Activity Monitor's "Memory Used": physical RAM minus pages that
-    /// are free, speculative, or file-backed cache. The side breakdown
-    /// (App/Wired/Compressed) does not expose every bucket counted in the total.
+    /// Matches Activity Monitor's Memory Used: app memory, wired memory,
+    /// compressed memory and the reserved tagged-memory storage region.
     static func memoryUsed(totalBytes: UInt64,
+                           appBytes: UInt64,
                            pageSize: UInt64,
-                           freePages: UInt64,
-                           speculativePages: UInt64,
-                           fileBackedPages: UInt64) -> UInt64 {
+                           wiredPages: UInt64,
+                           compressorPages: UInt64,
+                           tagStoragePages: UInt64) -> UInt64 {
         guard totalBytes > 0, pageSize > 0 else { return 0 }
-        let freeAndSpeculative = freePages.addingReportingOverflow(speculativePages)
-        guard !freeAndSpeculative.overflow else { return 0 }
-        let availablePages = freeAndSpeculative.partialValue.addingReportingOverflow(fileBackedPages)
-        guard !availablePages.overflow else { return 0 }
-        let availableBytes = availablePages.partialValue.multipliedReportingOverflow(by: pageSize)
-        guard !availableBytes.overflow else { return 0 }
-        return availableBytes.partialValue >= totalBytes ? 0 : totalBytes - availableBytes.partialValue
+        let wiredBytes = wiredPages.multipliedReportingOverflow(by: pageSize)
+        guard !wiredBytes.overflow else { return 0 }
+        let compressedBytes = compressorPages.multipliedReportingOverflow(by: pageSize)
+        guard !compressedBytes.overflow else { return 0 }
+        let tagStorageBytes = tagStoragePages.multipliedReportingOverflow(by: pageSize)
+        guard !tagStorageBytes.overflow else { return 0 }
+        let appAndWired = appBytes.addingReportingOverflow(wiredBytes.partialValue)
+        guard !appAndWired.overflow else { return 0 }
+        let withCompressed = appAndWired.partialValue.addingReportingOverflow(compressedBytes.partialValue)
+        guard !withCompressed.overflow else { return 0 }
+        let usedBytes = withCompressed.partialValue.addingReportingOverflow(tagStorageBytes.partialValue)
+        guard !usedBytes.overflow else { return 0 }
+        return min(usedBytes.partialValue, totalBytes)
     }
 
     /// Purgeable internal pages do not count because the system can reclaim
@@ -145,13 +160,23 @@ enum MetricFormat {
             value /= 1024
             index += 1
         }
+        // A value that only crosses 1024 once the number is rounded still reads
+        // as the larger unit, so promoting only before rounding labelled a
+        // megabyte "1,024 KB". `bytesPerSecCompact` already re-checks for this;
+        // doing it here keeps every byte rate one unit apart in name and value.
+        // Under ten the decimal is kept and can never reach 1024, and at the
+        // last unit there is nothing left to promote into.
+        while index < units.count - 1, value.rounded() >= 1024, index == 0 || value >= 10 {
+            value /= 1024
+            index += 1
+        }
         return (value, units[index])
     }
 
     /// Bytes (raw) → "0", "8" for B; one decimal under 10, none at or above.
     private static func number(_ value: Double, unit: String) -> String {
-        if unit == "B" { return String(format: "%.0f", value) }
-        return value < 10 ? String(format: "%.1f", value) : String(format: "%.0f", value)
+        if unit == "B" { return String(format: "%.0f", locale: Self.locale, value) }
+        return value < 10 ? String(format: "%.1f", locale: Self.locale, value) : String(format: "%.0f", locale: Self.locale, value)
     }
 
     /// A whole quantity of bytes, e.g. "1.2 GB". Used for session totals.
@@ -169,10 +194,10 @@ enum MetricFormat {
             index += 1
         }
         if units[index] == "B" {
-            return String(format: "%.0f B", value)
+            return String(format: "%.0f B", locale: Self.locale, value)
         }
-        return value < 10 ? String(format: "%.1f %@", value, units[index])
-            : String(format: "%.0f %@", value, units[index])
+        return value < 10 ? String(format: "%.1f %@", locale: Self.locale, value, units[index])
+            : String(format: "%.0f %@", locale: Self.locale, value, units[index])
     }
 
     static func diskBytesPrecise(_ bytes: UInt64) -> String {
@@ -185,13 +210,13 @@ enum MetricFormat {
         }
         let unit = units[index]
         if unit == "B" {
-            return String(format: "%.0f B", value)
+            return String(format: "%.0f B", locale: Self.locale, value)
         }
         if unit == "TB" || unit == "PB" {
-            return String(format: "%.2f %@", value, unit)
+            return String(format: "%.2f %@", locale: Self.locale, value, unit)
         }
-        return value < 10 ? String(format: "%.1f %@", value, unit)
-            : String(format: "%.0f %@", value, unit)
+        return value < 10 ? String(format: "%.1f %@", locale: Self.locale, value, unit)
+            : String(format: "%.0f %@", locale: Self.locale, value, unit)
     }
 
     /// A throughput, e.g. "1.2 MB/s". Used in the panel.
@@ -228,22 +253,107 @@ enum MetricFormat {
             if rounded >= 10 {
                 return "\(Int(rounded.rounded()))\(units[index])"
             }
-            return String(format: "%.1f%@", rounded, units[index])
+            return String(format: "%.1f%@", locale: Self.locale, rounded, units[index])
+        }
+        return "\(Int(value.rounded()))\(units[index])"
+    }
+
+    /// Whether live network speeds show bits ("12 Mbps") or bytes ("1.5 MB/s").
+    /// Only an explicit choice of bits reads as bits, so someone who never
+    /// picked a unit keeps the bytes they always saw.
+    static var networkSpeedInBits: Bool {
+        UserDefaults.standard.string(forKey: DefaultsKey.networkSpeedUnit) == NetworkSpeedUnit.bits.rawValue
+    }
+
+    /// A network speed in the chosen unit. Used in the panel.
+    static func networkRate(_ bytesPerSecond: Double, inBits: Bool = networkSpeedInBits) -> String {
+        inBits ? bitsPerSec(bytesPerSecond) : bytesPerSec(bytesPerSecond)
+    }
+
+    /// A compact network speed in the chosen unit, for the menu bar and lists.
+    static func networkRateCompact(_ bytesPerSecond: Double, inBits: Bool = networkSpeedInBits) -> String {
+        inBits ? bitsPerSecCompact(bytesPerSecond) : bytesPerSecCompact(bytesPerSecond)
+    }
+
+    /// A network bit rate, e.g. "12 Mbps". Takes bytes per second and uses
+    /// decimal (1000) steps. Used in the panel.
+    static func bitsPerSec(_ bytesPerSecond: Double) -> String {
+        let units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps", "Pbps"]
+        var value = bytesPerSecond.isFinite ? max(0, bytesPerSecond) * 8 : 0
+        var index = 0
+        // Promote on the number as printed, so 999.6 Kbps reads "1.0 Mbps"
+        // rather than "1000 Kbps", like the byte rates and the compact form.
+        // Under ten the decimal is kept and can never print as 1000.
+        while index < units.count - 1, value.rounded() >= 1000 {
+            value /= 1000
+            index += 1
+        }
+        if index == 0 {
+            return String(format: "%.0f %@", locale: Self.locale, value, units[index])
+        }
+        return value < 10 ? String(format: "%.1f %@", locale: Self.locale, value, units[index])
+            : String(format: "%.0f %@", locale: Self.locale, value, units[index])
+    }
+
+    /// A compact network bit rate for the menu bar, e.g. "9.6Mb", "320Kb",
+    /// "0b". Takes bytes per second and uses decimal (1000) steps, matching
+    /// how link speeds are quoted. Never wider than "999Kb".
+    static func bitsPerSecCompact(_ bytesPerSecond: Double) -> String {
+        let units = ["b", "Kb", "Mb", "Gb", "Tb", "Pb"]
+        var value = bytesPerSecond.isFinite ? max(0, bytesPerSecond) * 8 : 0
+        var index = 0
+        while index < units.count - 1 {
+            let shown = value < 10 && index > 0 ? (value * 10).rounded() / 10 : value.rounded()
+            guard shown >= 1000 else { break }
+            value /= 1000
+            index += 1
+        }
+        if index == 0 {
+            return "\(Int(value.rounded()))b"
+        }
+        if value < 10 {
+            let rounded = (value * 10).rounded() / 10
+            if rounded >= 10 {
+                return "\(Int(rounded.rounded()))\(units[index])"
+            }
+            return String(format: "%.1f%@", locale: Self.locale, rounded, units[index])
         }
         return "\(Int(value.rounded()))\(units[index])"
     }
 
     // MARK: Watts & percentages
 
+    /// The top of an auto-scaled graph: the peak rounded up to 1, 2 or 5 of a
+    /// unit, so its label reads "2.0 MB/s" and it only moves when the traffic
+    /// crosses a step. `unitStep` is 1024 for byte rates and 1000 for watts.
+    static func graphCeiling(_ peak: Double, unitStep: Double) -> Double {
+        for power in 0..<6 {
+            for step in [1.0, 2, 5, 10, 20, 50, 100, 200, 500] {
+                let ceiling = step * pow(unitStep, Double(power))
+                if ceiling >= peak { return ceiling }
+            }
+        }
+        return peak
+    }
+
+    /// A network graph ceiling in bytes per second that lands on a round
+    /// number in the chosen unit, so `networkRate` labels it as "20 Kbps"
+    /// or "2.0 KB/s" rather than an awkward conversion of the other.
+    static func networkGraphCeiling(_ peakBytesPerSecond: Double,
+                                    inBits: Bool = networkSpeedInBits) -> Double {
+        guard inBits else { return graphCeiling(peakBytesPerSecond, unitStep: 1024) }
+        return graphCeiling(peakBytesPerSecond * 8, unitStep: 1000) / 8
+    }
+
     /// Power, e.g. "8.5 W" / "23 W" (one decimal under 10, none above).
     static func watts(_ value: Double) -> String {
         let magnitude = abs(value)
-        return magnitude < 10 ? String(format: "%.1f W", value) : String(format: "%.0f W", value)
+        return magnitude < 10 ? String(format: "%.1f W", locale: Self.locale, value) : String(format: "%.0f W", locale: Self.locale, value)
     }
 
     /// Compact power for the menu bar, e.g. "9W".
     static func wattsCompact(_ value: Double) -> String {
-        String(format: "%.0fW", value.rounded())
+        String(format: "%.0fW", locale: Self.locale, value.rounded())
     }
 
     static func systemPowerWatts(measured: Double?,
@@ -254,9 +364,62 @@ enum MetricFormat {
         return -batteryWatts
     }
 
+    /// DC-In can include connected devices even without a battery. Keep the
+    /// desktop rail fallback in adapter input, separate from system power.
+    static func adapterPowerWatts(measured: Double?,
+                                  dcInRailWatts: Double?,
+                                  hasInternalBattery: Bool,
+                                  externalConnected: Bool) -> Double? {
+        if let measured { return measured }
+        guard !hasInternalBattery, externalConnected else { return nil }
+        return dcInRailWatts
+    }
+
     /// A 0...1 fraction as a rounded percentage, e.g. "12%".
     static func percent(_ fraction: Double) -> String {
         "\(Int((max(0, min(1, fraction)) * 100).rounded()))%"
+    }
+
+    /// Keeps process breakdown values on the same 0...100 scale as the
+    /// aggregate hardware meters.
+    static func boundedPercentage(_ percentage: Double) -> Double {
+        guard percentage.isFinite else { return 0 }
+        return max(0, min(100, percentage))
+    }
+
+    static func machTimeNanoseconds(_ ticks: UInt64,
+                                    numerator: UInt32,
+                                    denominator: UInt32) -> UInt64? {
+        guard denominator > 0 else { return nil }
+        let divisor = UInt64(denominator)
+        let multiplier = UInt64(numerator)
+        let whole = (ticks / divisor).multipliedReportingOverflow(by: multiplier)
+        guard !whole.overflow else { return nil }
+        let remainder = (ticks % divisor).multipliedReportingOverflow(by: multiplier)
+        guard !remainder.overflow else { return nil }
+        let nanoseconds = whole.partialValue.addingReportingOverflow(remainder.partialValue / divisor)
+        return nanoseconds.overflow ? nil : nanoseconds.partialValue
+    }
+
+    /// Converts a process's cumulative CPU-time delta into its share of the
+    /// machine over the same wall-clock interval used by the system monitor.
+    static func processCPUPercentage(previousNanoseconds: UInt64,
+                                     currentNanoseconds: UInt64,
+                                     elapsed: TimeInterval,
+                                     processorCount: Int) -> Double {
+        guard currentNanoseconds >= previousNanoseconds,
+              elapsed > 0, elapsed.isFinite else { return 0 }
+        let capacityNanoseconds = elapsed * 1_000_000_000 * Double(max(1, processorCount))
+        return boundedPercentage(Double(currentNanoseconds - previousNanoseconds) / capacityNanoseconds * 100)
+    }
+
+    /// Sampling APIs do not share a clock and can briefly over-attribute work.
+    /// Never let the process rows claim more than the matching aggregate meter.
+    static func processReconciliationScale(sampledTotal: Double,
+                                           aggregatePercentage: Double?) -> Double {
+        guard sampledTotal.isFinite, sampledTotal > 0,
+              let aggregatePercentage, aggregatePercentage.isFinite else { return 1 }
+        return min(1, boundedPercentage(aggregatePercentage) / sampledTotal)
     }
 
     /// Smooths the GPU usage readout enough to hide one-sample compositor spikes
@@ -276,9 +439,9 @@ enum MetricFormat {
     static func temperature(_ celsius: Double, unit: TemperatureUnit) -> String {
         switch unit {
         case .celsius:
-            return String(format: "%.0f °C", celsius)
+            return String(format: "%.0f °C", locale: Self.locale, celsius)
         case .fahrenheit:
-            return String(format: "%.0f °F", celsius * 9 / 5 + 32)
+            return String(format: "%.0f °F", locale: Self.locale, celsius * 9 / 5 + 32)
         }
     }
 
@@ -287,9 +450,9 @@ enum MetricFormat {
     static func temperatureCompact(_ celsius: Double, unit: TemperatureUnit) -> String {
         switch unit {
         case .celsius:
-            return String(format: "%.0f°", celsius)
+            return String(format: "%.0f°", locale: Self.locale, celsius)
         case .fahrenheit:
-            return String(format: "%.0f°", celsius * 9 / 5 + 32)
+            return String(format: "%.0f°", locale: Self.locale, celsius * 9 / 5 + 32)
         }
     }
 
@@ -340,17 +503,42 @@ enum MetricFormat {
     /// Whether an interface counts toward "real" network throughput. Loopback and
     /// virtual interfaces (AirDrop, VPN tunnels, bridges, etc.) are excluded so a
     /// VPN does not double-count the traffic already seen on the physical NIC.
+    /// `feth` interfaces come in pairs that each see the other's traffic the
+    /// other way round, so summing both made download and upload equal (#3429).
     static func includeNetworkInterface(_ name: String) -> Bool {
         guard !name.isEmpty else { return false }
         let excluded = ["lo", "gif", "stf", "awdl", "llw", "nan", "utun", "bridge",
-                        "ap", "anpi", "p2p", "XHC", "vmenet", "tap", "tun"]
+                        "ap", "anpi", "p2p", "XHC", "vmenet", "tap", "tun", "feth"]
         return !excluded.contains { name.hasPrefix($0) }
+    }
+
+    /// The interfaces whose counters make up the reading. A bridge the system
+    /// routes through is the connection itself, as when a virtual network
+    /// carries all traffic and the Wi-Fi sits idle, so then the primary
+    /// interfaces are counted instead: leaving the bridge out would leave
+    /// nothing, and adding its members would count the same traffic twice.
+    /// A VPN tunnel as primary keeps the usual rule, which counts the
+    /// physical interface underneath it.
+    static func countedNetworkInterfaces(_ names: [String], primaries: [String]) -> Set<String> {
+        let available = Set(names)
+        let routed = primaries.filter { available.contains($0) }
+        guard routed.contains(where: { $0.hasPrefix("bridge") }) else {
+            return available.filter(includeNetworkInterface)
+        }
+        return Set(routed.filter { $0.hasPrefix("bridge") || includeNetworkInterface($0) })
     }
 }
 
 enum TemperatureUnit: String {
     case celsius
     case fahrenheit
+}
+
+/// How live network speeds read: bytes ("1.5 MB/s"), the default, or bits
+/// ("12 Mbps"), the way connection speeds are usually quoted.
+enum NetworkSpeedUnit: String {
+    case bytes
+    case bits
 }
 
 /// Fixed-size ring of recent samples (oldest → newest) for the history graphs.

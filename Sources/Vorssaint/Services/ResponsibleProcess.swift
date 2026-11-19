@@ -31,16 +31,23 @@ enum ResponsibleProcess {
         return owner > 0 ? owner : pid
     }
 
-    /// The regular app to bill the process to, following the parent chain
-    /// when the responsibility API dead-ends on a helper that answers for
-    /// itself (browser audio helpers, issue #256). Nil when no ancestor is
-    /// a regular app — daemons and login items stay unlisted.
+    /// Secure Input and Now Playing attribute a process to its responsible app
+    /// first, even if the process is itself a regular app.
     static func regularAppOwner(of pid: pid_t) -> NSRunningApplication? {
-        MixerRoutingSupport.owningRegularAppPid(
+        regularAppOwnerPid(of: pid, preferProcessItself: false)
+            .flatMap(NSRunningApplication.init(processIdentifier:))
+    }
+
+    /// Audio attribution prefers a regular app playing its own sound over
+    /// its launcher. Use the real pid that was checked; the workspace can
+    /// report -1 for Steam or Device Hub even when found by their real pid.
+    static func regularAppOwnerPid(of pid: pid_t, preferProcessItself: Bool = true) -> pid_t? {
+        MixerRoutingSupport.regularAppOwnerPid(
+            of: pid,
             responsiblePid: owner(of: pid),
+            preferProcessItself: preferProcessItself,
             isRegularApp: { NSRunningApplication(processIdentifier: $0)?.activationPolicy == .regular },
-            parentPid: parent(of:)
-        ).flatMap(NSRunningApplication.init(processIdentifier:))
+            parentPid: parent(of:))
     }
 
     private static func parent(of pid: pid_t) -> pid_t {
@@ -60,6 +67,14 @@ enum ResponsibleProcess {
         var buffer = [CChar](repeating: 0, count: 256)
         if proc_name(pid, &buffer, UInt32(buffer.count)) > 0 {
             let name = String(cString: buffer)
+            if !name.isEmpty { return name }
+        }
+        // macOS 27 refuses proc_name for another user's process, such as
+        // WindowServer or a daemon, and the GPU list showed "pid 100" for
+        // them. Their executable path stays readable.
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
+            let name = (String(cString: path) as NSString).lastPathComponent
             if !name.isEmpty { return name }
         }
         return fallback.trimmingCharacters(in: .whitespaces)

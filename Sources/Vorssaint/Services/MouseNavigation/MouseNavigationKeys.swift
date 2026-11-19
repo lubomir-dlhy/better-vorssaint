@@ -14,24 +14,30 @@ import Carbon.HIToolbox
 /// interface reads right to left.
 ///
 /// macOS does not say where it moved the shortcut to, but it performs the same
-/// move on a menu of ours: a hidden pair of items declaring the brackets is
-/// added to the app's menu for one turn of the run loop, and the keys macOS
-/// writes back onto them are the ones the app in front is showing too. Main
-/// thread only, like everything that touches the menu.
+/// move on a menu of ours, and the keys it writes back there are the ones the
+/// app in front is showing too. The Settings Go menu declares both commands,
+/// so its items carry the answer. Without that menu, a hidden pair of items
+/// declaring the brackets is added to the app's menu for one turn of the run
+/// loop instead. Main thread only, like everything that touches the menu.
 enum MouseNavigationKeys {
     /// The key a command ended up on, and the modifiers a menu reports for it.
-    struct Shortcut {
+    struct Shortcut: Equatable {
         var character: String
         var menuModifiers: UInt32
     }
 
     private static var resolved: [MouseNavigationDirection: Shortcut] = [:]
 
-    /// What to look for in the menu of the app in front. Until the system has
-    /// answered, the declared bracket with Command alone stands in, which is
-    /// already the right answer on every keyboard that can type it.
+    /// What to look for in the menu of the app in front. The Go item is read
+    /// on every click, since macOS keeps it on the current keyboard. Until the
+    /// system has answered, the declared bracket with Command alone stands in,
+    /// which is already the right answer on every keyboard that can type it.
     static func shortcut(for direction: MouseNavigationDirection) -> Shortcut {
-        resolved[direction] ?? Shortcut(
+        if let item = NSApp?.mainMenu.flatMap({ SettingsWindow.navigationItem(for: direction, in: $0) }),
+           let shortcut = shortcut(of: item) {
+            return shortcut
+        }
+        return resolved[direction] ?? Shortcut(
             character: MouseNavigationSupport.commandCharacter(for: direction),
             menuModifiers: 0)
     }
@@ -42,6 +48,11 @@ enum MouseNavigationKeys {
     /// changes, both far ahead of any click.
     static func refresh() {
         guard let mainMenu = NSApp?.mainMenu else { return }
+        // macOS gives a shortcut only to the first item that declares it, so a
+        // hidden pair beside the Go menu would come back with no key at all.
+        guard MouseNavigationDirection.allCases.contains(where: {
+            SettingsWindow.navigationItem(for: $0, in: mainMenu) == nil
+        }) else { return }
         let host = NSMenuItem()
         // The app's menu bar is visible while one of its own windows is
         // focused, so the probe must never be drawable.
@@ -61,23 +72,37 @@ enum MouseNavigationKeys {
 
         DispatchQueue.main.async {
             for (direction, item) in probes {
-                guard let character = MouseNavigationSupport
-                    .sanitizedCommandCharacter(item.keyEquivalent) else {
-                    resolved[direction] = nil
-                    continue
-                }
-                let mask = item.keyEquivalentModifierMask
-                resolved[direction] = Shortcut(
-                    character: character,
-                    menuModifiers: MouseNavigationSupport.menuModifiers(
-                        shift: mask.contains(.shift),
-                        option: mask.contains(.option),
-                        control: mask.contains(.control),
-                        command: mask.contains(.command),
-                        character: character))
+                resolved[direction] = shortcut(of: item)
             }
             mainMenu.removeItem(host)
         }
+    }
+
+    /// What to look for, most likely first: the key the Go item carries, then
+    /// the declared bracket. AppKit may re-localize an inactive app's menu only
+    /// once it is active, so after a switch to a keyboard that types brackets
+    /// the Go item can still carry the key of the one before; the bracket is
+    /// what the app in front shows then.
+    static func candidates(for direction: MouseNavigationDirection) -> [Shortcut] {
+        let declared = Shortcut(character: MouseNavigationSupport.commandCharacter(for: direction), menuModifiers: 0)
+        let current = shortcut(for: direction)
+        return current == declared ? [current] : [current, declared]
+    }
+
+    /// The key macOS left on an item declaring one of the commands, or nil
+    /// when the item carries none.
+    private static func shortcut(of item: NSMenuItem) -> Shortcut? {
+        guard let character = MouseNavigationSupport
+            .sanitizedCommandCharacter(item.keyEquivalent) else { return nil }
+        let mask = item.keyEquivalentModifierMask
+        return Shortcut(
+            character: character,
+            menuModifiers: MouseNavigationSupport.menuModifiers(
+                shift: mask.contains(.shift),
+                option: mask.contains(.option),
+                control: mask.contains(.control),
+                command: mask.contains(.command),
+                character: character))
     }
 
     /// Forgets the answer, so the declared brackets stand in again until the
@@ -88,27 +113,43 @@ enum MouseNavigationKeys {
     /// for the rare fallback that has to type the shortcut instead of pressing
     /// the menu item. Nil when no key produces it without Option, which is the
     /// case the system's own move exists to avoid.
-    static func keyStroke(for character: String) -> (keyCode: CGKeyCode, needsShift: Bool)? {
-        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+    static func keyStroke(for character: String, command: Bool = false) -> (keyCode: CGKeyCode, needsShift: Bool)? {
+        guard Thread.isMainThread,
+              let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else {
             return nil
         }
         let data = Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue() as Data
+        return keyStroke(for: character, layout: data, command: command)
+    }
+
+    /// Some layouts, including Dvorak–QWERTY Command, have a distinct
+    /// Command map. Resolve the same modifiers the caller will actually post.
+    static func keyStroke(for character: String, layout: Data,
+                           command: Bool) -> (keyCode: CGKeyCode, needsShift: Bool)? {
         // Plain keys first: a shortcut that needs Shift is a worse match than
         // the same character sitting on a key of its own.
         for needsShift in [false, true] {
-            for keyCode in UInt16(0)...127 where producedCharacter(from: data, keyCode: keyCode, shift: needsShift) == character {
+            for keyCode in UInt16(0)...127
+                where keyCode != UInt16(kVK_ANSI_KeypadPlus) && keyCode != UInt16(kVK_ANSI_KeypadMinus)
+                    && producedCharacter(from: layout, keyCode: keyCode, shift: needsShift, command: command) == character {
                 return (CGKeyCode(keyCode), needsShift)
             }
+        }
+        // The US Command table suppresses Shift for punctuation and reports
+        // "=" for Shift-Command-Equal too. Standard zoom-in uses that key;
+        // resolve Equal in the Command map, never in the typing layout.
+        if command, character == "+", let equal = keyStroke(for: "=", layout: layout, command: true) {
+            return (equal.keyCode, true)
         }
         return nil
     }
 
-    private static func producedCharacter(from layout: Data, keyCode: UInt16, shift: Bool) -> String? {
+    private static func producedCharacter(from layout: Data, keyCode: UInt16, shift: Bool, command: Bool) -> String? {
         var deadKeyState: UInt32 = 0
         var length = 0
         var characters = [UniChar](repeating: 0, count: 8)
-        let modifiers = shift ? UInt32(shiftKey >> 8) : 0
+        let modifiers = UInt32(((shift ? shiftKey : 0) | (command ? cmdKey : 0)) >> 8)
         let status = layout.withUnsafeBytes { raw -> OSStatus in
             guard let base = raw.bindMemory(to: UCKeyboardLayout.self).baseAddress else { return -1 }
             return UCKeyTranslate(base,

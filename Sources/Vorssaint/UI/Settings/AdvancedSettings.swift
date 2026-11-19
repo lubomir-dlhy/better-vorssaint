@@ -10,12 +10,15 @@ struct AdvancedSettings: View {
     @ObservedObject private var l10n = L10n.shared
     @State private var showClearConfirm = false
     @State private var showUninstallConfirm = false
+    @State private var uninstallFailed = false
+    @State private var uninstallFailedBody = ""
     @State private var working = false
-    @State private var cleared = false
-    @State private var exported = false
+    @State private var cleared: Bool?
+    @State private var exported: Bool?
     @State private var importFailed = false
     @State private var pendingImport: [String: Any]?
     @State private var showImportConfirm = false
+    @State private var showConfigFileConfirm = false
 
     private var backup: BackupFeatureStrings {
         FeatureStrings.backup(l10n.language)
@@ -28,15 +31,15 @@ struct AdvancedSettings: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 10) {
+                FlowLayoutLite(spacing: 10) {
                     Button {
                         importFailed = false
-                        exported = SettingsBackup.runExportPanel() == true
+                        exported = SettingsBackup.runExportPanel()
                     } label: {
                         Label(backup.exportButton, systemImage: "square.and.arrow.up")
                     }
                     Button {
-                        exported = false
+                        exported = nil
                         importFailed = false
                         guard let url = SettingsBackup.runImportPanel() else { return }
                         if let settings = SettingsBackup.readSettings(at: url) {
@@ -48,12 +51,23 @@ struct AdvancedSettings: View {
                     } label: {
                         Label(backup.importButton, systemImage: "square.and.arrow.down")
                     }
+                    Button {
+                        exported = nil
+                        importFailed = false
+                        showConfigFileConfirm = true
+                    } label: {
+                        Label(backup.configFileButton, systemImage: "doc.badge.gearshape")
+                    }
                 }
-                if exported {
+                if exported == true {
                     HStack(spacing: 6) {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                         Text(backup.exported).font(.caption).foregroundStyle(.green)
                     }
+                } else if exported == false {
+                    Text(backup.exportFailed)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
                 if importFailed {
                     Text(backup.invalidFile)
@@ -73,11 +87,15 @@ struct AdvancedSettings: View {
                     Label(l10n.s.advancedClearButton, systemImage: "lock.slash")
                 }
                 .disabled(working)
-                if cleared {
+                if cleared == true {
                     HStack(spacing: 6) {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                         Text(l10n.s.advancedCleared).font(.caption).foregroundStyle(.green)
                     }
+                } else if cleared == false {
+                    Text(l10n.s.advancedClearFailed)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }
 
@@ -99,10 +117,10 @@ struct AdvancedSettings: View {
             Button(l10n.s.uninstallerCancel, role: .cancel) {}
             Button(l10n.s.advancedClearButton, role: .destructive) {
                 working = true
-                cleared = false
-                SelfUninstall.clearPermissions {
+                cleared = nil
+                SelfUninstall.clearPermissions { succeeded in
                     working = false
-                    cleared = true
+                    cleared = succeeded
                 }
             }
         } message: {
@@ -112,10 +130,22 @@ struct AdvancedSettings: View {
             Button(l10n.s.uninstallerCancel, role: .cancel) {}
             Button(l10n.s.advancedUninstallButton, role: .destructive) {
                 working = true
-                SelfUninstall.uninstallCompletely()
+                SelfUninstall.uninstallCompletely { body in
+                    working = false
+                    uninstallFailedBody = body
+                    // Stopping leaves the Mac exactly as it was, so the only
+                    // thing left to do is say so: the button going quiet on
+                    // its own reads as the app ignoring the request.
+                    uninstallFailed = true
+                }
             }
         } message: {
             Text(l10n.s.advancedUninstallConfirmBody)
+        }
+        .alert(l10n.s.advancedUninstallFailedTitle, isPresented: $uninstallFailed) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(uninstallFailedBody)
         }
         .alert(backup.importConfirmTitle, isPresented: $showImportConfirm) {
             Button(l10n.s.uninstallerCancel, role: .cancel) { pendingImport = nil }
@@ -125,7 +155,24 @@ struct AdvancedSettings: View {
                 }
             }
         } message: {
-            Text(backup.importConfirmBody)
+            let body = SettingsBackupSupport.omitsDynamicIslandSettings(pendingImport ?? [:])
+                ? backup.importMissingIslandBody : backup.importConfirmBody
+            if FileManager.default.fileExists(atPath: SettingsBackup.configFileURL.path) {
+                Text(body + "\n\n" + backup.importConfigFileNotice)
+            } else {
+                Text(body)
+            }
+        }
+        .alert(backup.configFileConfirmTitle, isPresented: $showConfigFileConfirm) {
+            Button(l10n.s.uninstallerCancel, role: .cancel) {}
+            Button(backup.configFileAction) {
+                exported = SettingsBackup.writeConfigFile()
+            }
+        } message: {
+            // The path names the folder XDG_CONFIG_HOME selected, so a user
+            // can tell which file a dotfiles manager will see change.
+            Text(String(format: backup.configFileConfirmFormat,
+                        (SettingsBackup.configFileURL.path as NSString).abbreviatingWithTildeInPath))
         }
     }
 }

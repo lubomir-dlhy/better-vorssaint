@@ -3,8 +3,7 @@
 
 import AVFoundation
 import CoreGraphics
-import ImageIO
-import UniformTypeIdentifiers
+import CoreImage
 
 /// Writes the finished file: reads the master, applies the edit and encodes.
 ///
@@ -35,7 +34,6 @@ final class RecorderExporter {
         case noVideo
         case readFailed
         case writeFailed
-        case tooLongForGIF
         case tooLargeForSharing
         case invalidShareArtifact
         case cancelled
@@ -72,28 +70,41 @@ final class RecorderExporter {
         guard sourceSize.width > 0, sourceSize.height > 0 else { return .noVideo }
         let frameRate = Int(((try? await videoTrack.load(.nominalFrameRate)) ?? 60).rounded())
 
-        try? FileManager.default.removeItem(at: destination)
-
+        // The file is written beside the destination and only takes its place
+        // once it is whole. Save as can be pointed at a recording that already
+        // exists, and a cancel or a failure halfway through must leave that
+        // recording where it is instead of taking it down with the attempt.
+        let staged = RecorderSupport.stagingURL(for: destination)
+        defer { try? FileManager.default.removeItem(at: staged) }
+        let failure: Failure?
         switch output {
         case .video:
-            return await exportVideo(asset: asset,
-                                     videoTrack: videoTrack,
-                                     pointerURL: take.pointerURL,
-                                     document: document,
-                                     trim: trim,
-                                     sourceSize: sourceSize,
-                                     frameRate: RecorderSupport.sanitizedFrameRate(frameRate),
-                                     to: destination,
-                                     progress: progress)
+            failure = await exportVideo(asset: asset,
+                                        videoTrack: videoTrack,
+                                        pointerURL: take.pointerURL,
+                                        document: document,
+                                        trim: trim,
+                                        sourceSize: sourceSize,
+                                        frameRate: RecorderSupport.sanitizedFrameRate(frameRate),
+                                        to: staged,
+                                        progress: progress)
         case .gif:
-            return await exportGIF(asset: asset,
-                                   videoTrack: videoTrack,
-                                   pointerURL: take.pointerURL,
-                                   document: document,
-                                   sourceSize: sourceSize,
-                                   to: destination,
-                                   progress: progress)
+            failure = await exportGIF(asset: asset,
+                                      videoTrack: videoTrack,
+                                      pointerURL: take.pointerURL,
+                                      document: document,
+                                      sourceSize: sourceSize,
+                                      to: staged,
+                                      progress: progress)
         }
+        if let failure { return failure }
+        // Finalizing the video or GIF can finish after a cancellation arrives.
+        // The destination must still be kept until that last chance to cancel.
+        guard !cancelled.isCancelled else { return .cancelled }
+        guard RecorderSupport.commitExport(from: staged, to: destination) else {
+            return .writeFailed
+        }
+        return nil
     }
 
     /// Produces the only artifact the sharing service accepts. There is no
@@ -185,7 +196,8 @@ final class RecorderExporter {
         let keepsAnyAudio = document.keepsSystemAudio || document.keepsMicrophone
         guard let result = await RecorderComposition.build(from: asset,
                                                            ranges: ranges,
-                                                           includesAudio: keepsAnyAudio),
+                                                           includesAudio: keepsAnyAudio,
+                                                           playbackSpeed: document.exportTiming.speed),
               let timelineVideo = try? await result.asset.loadTracks(withMediaType: .video).first
         else { return .readFailed }
         let timeline = result.asset
@@ -233,14 +245,16 @@ final class RecorderExporter {
             ?? sharingPlan?.size
             ?? RecorderSupport.outputSize(source: RecorderSupport.evenSize(sourceSize),
                                           quality: document.resolvedQuality)
-        let composition = await RecorderComposer.videoComposition(
+        guard let composition = await RecorderComposer.videoComposition(
             track: timelineVideo,
             asset: timeline,
             duration: timelineDuration,
             frameRate: outputFrameRate,
             composer: composer,
             sourceSize: sourceSize,
-            outputSize: outputSize)
+            outputSize: outputSize,
+            playbackSpeed: document.exportTiming.speed)
+        else { return .readFailed }
 
         guard let reader = try? AVAssetReader(asset: timeline),
               let writer = try? AVAssetWriter(outputURL: destination, fileType: .mp4)
@@ -268,6 +282,11 @@ final class RecorderExporter {
                 ])
             output.audioMix = RecorderComposition.audioMix(trackIDs: result.audioTrackIDs,
                                                            document: document)
+            if document.exportTiming.speed != 1 {
+                // Decode scaled audio edits at their new duration while
+                // preserving speech pitch, rather than relabeling PCM times.
+                output.audioTimePitchAlgorithm = .spectral
+            }
             output.alwaysCopiesSampleData = false
             if reader.canAdd(output) {
                 reader.add(output)
@@ -286,6 +305,7 @@ final class RecorderExporter {
                                                quality: document.resolvedQuality,
                                                codec: .hevc)
             resolved = writer.canApply(outputSettings: preferred, forMediaType: .video)
+                && RecorderWriter.hevcEncodes(width: Int(outputSize.width), height: Int(outputSize.height))
                 ? preferred
                 : Self.videoSettings(size: outputSize,
                                      frameRate: outputFrameRate,
@@ -321,6 +341,7 @@ final class RecorderExporter {
         let expectedFrames = max(1, Int((timelineDuration.seconds
             * Double(outputFrameRate)).rounded()))
         let counter = FrameCounter()
+        let frameProgress = ProgressThrottle(progress)
 
         await withTaskGroup(of: Void.self) { group in
             group.addTask { [cancelled] in
@@ -333,7 +354,7 @@ final class RecorderExporter {
                     // Weighted so the bar never parks at almost-done while the
                     // sound is still being written. It reaches one when the
                     // file is closed, and not before.
-                    progress(min(0.9, Double(done) / Double(expectedFrames) * 0.9))
+                    frameProgress.report(min(0.9, Double(done) / Double(expectedFrames) * 0.9))
                 }
             }
             if let audioInput, let audioOutput {
@@ -524,10 +545,9 @@ final class RecorderExporter {
 
     // MARK: - GIF
 
-    /// A GIF is written by ImageIO, which holds every frame until the file is
-    /// closed. The frame budget in RecorderSupport is what keeps that from
-    /// becoming the memory of the whole machine, so it is enforced here before
-    /// a single frame is decoded.
+    /// Sample the edited timeline and encode it chunk by chunk into a
+    /// disk-backed GIF. Decoded frames never exceed one chunk and the encoded
+    /// file is not held in memory, however long the recording gets.
     private func exportGIF(asset: AVURLAsset,
                            videoTrack: AVAssetTrack,
                            pointerURL: URL,
@@ -544,84 +564,207 @@ final class RecorderExporter {
         let ranges = document.keptRanges(duration: duration)
         guard let result = await RecorderComposition.build(from: asset,
                                                            ranges: ranges,
-                                                           includesAudio: false),
+                                                           includesAudio: false,
+                                                           playbackSpeed: document.exportTiming.speed),
               let timelineVideo = try? await result.asset.loadTracks(withMediaType: .video).first
         else { return .readFailed }
         let timeline = result.asset
         let outputDuration = CMTimeGetSeconds((try? await timeline.load(.duration)) ?? .zero)
-        guard RecorderSupport.gifFitsBudget(duration: outputDuration, fps: fps) else {
-            return .tooLongForGIF
-        }
         let frameCount = RecorderSupport.gifFrameCount(duration: outputDuration, fps: fps)
         guard frameCount > 0 else { return .noVideo }
 
         // Rendered through the same composer as the video, so a background and
-        // a smoothed pointer are in it too.
+        // a smoothed pointer are in it too, at the editor's GIF scale.
         let frameRate = Int(((try? await videoTrack.load(.nominalFrameRate)) ?? 60).rounded())
         let track = RecorderPointerTrack.decoded(try? Data(contentsOf: pointerURL))
         let plan = RecorderComposer.makePlan(document: document,
                                              track: track,
                                              sourceSize: sourceSize,
                                              frameRate: RecorderSupport.sanitizedFrameRate(frameRate),
-                                             duration: duration)
+                                             duration: duration,
+                                             outputScale: CGFloat(document.outputScale(for: .gif)),
+                                             outputFormat: .gif)
         let composer = plan.map { RecorderComposer(plan: $0) }
-        let canvas = composer?.canvasSize ?? RecorderSupport.evenSize(sourceSize)
-        let size = RecorderSupport.gifOutputSize(source: canvas, size: document.resolvedGIFSize)
+        // GIF dimensions are independent of the video bitrate and size preset.
+        let canvas = composer?.canvasSize
+            ?? RecorderSupport.gifOutputSize(source: RecorderSupport.evenSize(sourceSize),
+                scalePercent: document.resolvedGIFScalePercent)
 
+        let formats = (try? await videoTrack.load(.formatDescriptions)) ?? []
+        let characteristics = try? await videoTrack.load(.mediaCharacteristics)
+        let canReadDirectly = characteristics?.contains(.containsAlphaChannel) == false
+            && Self.supportsFastGIF(formats)
+        // Decode imports with special geometry or alpha at presentation size
+        // before applying edits. A raw raster can be narrower than the plan,
+        // and AV video composition flattens transparent input over black.
+        // Pure resizing also stays after decoding so missing frames are reported.
+        let renderAfterDecode = composer != nil && (plan?.isScaleOnly == true || !canReadDirectly)
+        let renderContext = renderAfterDecode ? CIContext(options: [.cacheIntermediates: false]) : nil
         let generator = AVAssetImageGenerator(asset: timeline)
+        defer { generator.cancelAllCGImageGeneration() }
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
-        generator.maximumSize = size
-        if let composer {
-            generator.videoComposition = await RecorderComposer.videoComposition(
+        generator.maximumSize = composer == nil ? canvas : (renderAfterDecode ? sourceSize : .zero)
+        if let composer, !renderAfterDecode {
+            guard let composition = await RecorderComposer.videoComposition(
                 track: timelineVideo,
                 asset: timeline,
                 duration: (try? await timeline.load(.duration)) ?? .zero,
                 frameRate: RecorderSupport.sanitizedFrameRate(frameRate),
                 composer: composer,
                 sourceSize: sourceSize,
-                outputSize: canvas)
+                outputSize: canvas,
+                playbackSpeed: document.exportTiming.speed)
+            else { return .readFailed }
+            generator.videoComposition = composition
         }
 
-        guard let sink = CGImageDestinationCreateWithURL(destination as CFURL,
-                                                         UTType.gif.identifier as CFString,
-                                                         frameCount,
-                                                         nil)
-        else { return .writeFailed }
-        CGImageDestinationSetProperties(sink, [
-            kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0],
-        ] as CFDictionary)
+        let frameProgress = ProgressThrottle(progress)
+        let canUseFastEncoder = canvas.width * canvas.height >= 512 * 512 && canReadDirectly
 
-        let delay = RecorderSupport.gifDelay(fps: fps)
-        // Readers clamp anything under 100 ms unless the unclamped delay is
-        // written as well, so both go in and a 12 fps GIF actually plays at
-        // 12 fps instead of at 10.
-        let frameProperties = [
-            kCGImagePropertyGIFDictionary: [
-                kCGImagePropertyGIFDelayTime: delay,
-                kCGImagePropertyGIFUnclampedDelayTime: delay,
-            ],
-        ] as CFDictionary
-
-        for index in 0..<frameCount {
-            if cancelled.isCancelled {
-                try? FileManager.default.removeItem(at: destination)
-                return .cancelled
+        func write(useFastEncoder: Bool) async throws -> Failure? {
+            if cancelled.isCancelled { return .cancelled }
+            let workspace = try RecorderGIFWorkspace()
+            defer { workspace.discard() }
+            let writer = try RecorderGIFWriter(url: workspace.fileURL, fps: fps)
+            if useFastEncoder, let fast = RecorderFastGIFWriter(writer: writer, size: canvas,
+                    isCancelled: { [cancelled] in cancelled.isCancelled }) {
+                try await writeFastGIFFrames(fast, timeline: timeline, track: timelineVideo,
+                    composer: composer, canvas: canvas, timing: document.exportTiming,
+                    fps: fps, frameCount: frameCount, progress: frameProgress)
+            } else {
+                // Use the generator as well as ImageIO on fallback. It applies
+                // display geometry, preserves alpha and recovers individual
+                // images after damaged stretches that stop a sequential reader.
+                var previous: CGImage?
+                var missing = 0
+                for index in 0..<frameCount {
+                    if cancelled.isCancelled { return .cancelled }
+                    let seconds = Double(index) / Double(fps)
+                    let time = CMTime(seconds: seconds, preferredTimescale: 600)
+                    let decoded = try? await generator.image(at: time).image
+                    if let frame = decoded ?? previous {
+                        for outputIndex in (index - missing)...index {
+                            if cancelled.isCancelled { return .cancelled }
+                            if let renderContext, let composer {
+                                let editTime = document.exportTiming.sourceTime(forOutputTime: Double(outputIndex) / Double(fps))
+                                let rendered = composer.render(CIImage(cgImage: frame), at: editTime)
+                                guard let picture = renderContext.createCGImage(rendered, from: CGRect(origin: .zero, size: canvas))
+                                else { return .readFailed }
+                                try writer.append(picture)
+                            } else {
+                                try writer.append(frame)
+                            }
+                        }
+                        missing = 0
+                        previous = frame
+                    } else { missing += 1 }
+                    frameProgress.report(min(0.99, Double(index + 1) / Double(frameCount)))
+                }
+                guard previous != nil else { return .readFailed }
+                if cancelled.isCancelled { return .cancelled }
+                try writer.finish()
             }
-            let seconds = min(outputDuration, Double(index) / Double(fps))
-            let time = CMTime(seconds: seconds, preferredTimescale: 600)
-            guard let frame = try? await generator.image(at: time).image else { continue }
-            CGImageDestinationAddImage(sink, frame, frameProperties)
-            progress(min(0.99, Double(index + 1) / Double(frameCount)))
+            if cancelled.isCancelled { return .cancelled }
+            try FileManager.default.copyItem(at: workspace.fileURL, to: destination)
+            return nil
         }
 
-        guard CGImageDestinationFinalize(sink) else {
-            try? FileManager.default.removeItem(at: destination)
+        do {
+            do {
+                if let failure = try await write(useFastEncoder: canUseFastEncoder) { return failure }
+            } catch RecorderFastGIFWriter.Failure.unavailable {
+                // The first attempt has released its workspace, decoder and
+                // buffers. The same throttle ignores lower progress on retry.
+                if let failure = try await write(useFastEncoder: false) { return failure }
+            }
+        } catch RecorderFastGIFWriter.Failure.cancelled {
+            return .cancelled
+        } catch {
             return .writeFailed
         }
         progress(1)
         return nil
+    }
+
+    private func writeFastGIFFrames(_ writer: RecorderFastGIFWriter, timeline: AVAsset, track: AVAssetTrack,
+                                    composer: RecorderComposer?, canvas: CGSize, timing: RecorderExportTiming,
+                                    fps: Int, frameCount: Int, progress: ProgressThrottle) async throws {
+        guard let reader = try? AVAssetReader(asset: timeline),
+              let naturalSize = try? await track.load(.naturalSize),
+              let transform = try? await track.load(.preferredTransform)
+        else { throw RecorderFastGIFWriter.Failure.unavailable }
+        let frames = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        ])
+        frames.alwaysCopiesSampleData = false
+        guard reader.canAdd(frames) else { throw RecorderFastGIFWriter.Failure.unavailable }
+        reader.add(frames)
+        guard reader.startReading() else { throw RecorderFastGIFWriter.Failure.unavailable }
+        defer { reader.cancelReading() }
+
+        let geometry = RecorderSupport.videoGeometry(naturalSize: naturalSize, preferredTransform: transform)
+        // Track transforms use a top-left origin; Core Image uses bottom-left.
+        let imageTransform = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: naturalSize.height)
+            .concatenating(geometry.transform)
+            .concatenating(CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: geometry.size.height))
+        var currentSample: CMSampleBuffer?
+        var nextSample = frames.copyNextSampleBuffer()
+        for index in 0..<frameCount {
+            let seconds = Double(index) / Double(fps)
+            let time = CMTime(seconds: seconds, preferredTimescale: 600)
+            try autoreleasepool {
+                if cancelled.isCancelled { throw RecorderFastGIFWriter.Failure.cancelled }
+                while let sample = nextSample, CMSampleBufferGetPresentationTimeStamp(sample) <= time {
+                    currentSample = sample
+                    nextSample = frames.copyNextSampleBuffer()
+                    if cancelled.isCancelled { throw RecorderFastGIFWriter.Failure.cancelled }
+                }
+                guard reader.status != .failed, let sample = currentSample,
+                      CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(sample),
+                                CMSampleBufferGetDuration(sample)) > time,
+                      let pixel = CMSampleBufferGetImageBuffer(sample),
+                      CGSize(width: CVPixelBufferGetWidth(pixel), height: CVPixelBufferGetHeight(pixel)) == naturalSize
+                else { throw RecorderFastGIFWriter.Failure.unavailable }
+                let source = CIImage(cvPixelBuffer: pixel).transformed(by: imageTransform)
+                let rendered = composer?.render(source, at: timing.sourceTime(forOutputTime: seconds))
+                    ?? source.transformed(by: CGAffineTransform(scaleX: canvas.width / geometry.size.width,
+                                                               y: canvas.height / geometry.size.height))
+                let sourceBytes = CVPixelBufferGetDataSize(pixel)
+                guard sourceBytes > 0 else { throw RecorderFastGIFWriter.Failure.unavailable }
+                try writer.append(rendered, sourceBytes: sourceBytes)
+            }
+            progress.report(min(0.99, Double(index + 1) / Double(frameCount)))
+        }
+        try writer.finish()
+    }
+
+    static func supportsFastGIF(_ formats: [CMFormatDescription]) -> Bool {
+        !formats.isEmpty && formats.allSatisfy { format in
+            let codec = CMFormatDescriptionGetMediaSubType(format)
+            guard codec == kCMVideoCodecType_H264 || codec == kCMVideoCodecType_HEVC else { return false }
+            let extensions = CMFormatDescriptionGetExtensions(format).map { $0 as NSDictionary } ?? [:]
+            // HEVC with alpha also identifies itself as hvc1. NV12 drops the
+            // alpha plane before any shader could inspect it.
+            guard (extensions[kCMFormatDescriptionExtension_ContainsAlphaChannel] as? NSNumber)?.boolValue != true,
+                  extensions[kCMFormatDescriptionExtension_AlphaChannelMode] == nil else { return false }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+            let encoded = CGSize(width: Int(dimensions.width), height: Int(dimensions.height))
+            // The generator applies clean aperture and pixel aspect ratio.
+            // A direct pixel buffer only has the encoded raster.
+            guard CMVideoFormatDescriptionGetPresentationDimensions(format, usePixelAspectRatio: true,
+                      useCleanAperture: false) == encoded,
+                  CMVideoFormatDescriptionGetCleanAperture(format, originIsAtTopLeft: true)
+                    == CGRect(origin: .zero, size: encoded) else { return false }
+            let transfer = extensions[kCMFormatDescriptionExtension_TransferFunction] as? String
+            let primaries = extensions[kCMFormatDescriptionExtension_ColorPrimaries] as? String
+            // Unknown HEVC can be untagged HDR. Do not force it through 8-bit NV12.
+            if transfer == nil && codec == kCMVideoCodecType_HEVC { return false }
+            return (transfer == nil || transfer == (kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String)
+                    || transfer == (kCMFormatDescriptionTransferFunction_sRGB as String))
+                && (primaries == nil || primaries == (kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String))
+        }
     }
 }
 
@@ -652,6 +795,35 @@ private final class FrameCounter: @unchecked Sendable {
         defer { lock.unlock() }
         count += 1
         return count
+    }
+}
+
+/// Passes progress on at most ten times a second, and only once it has
+/// moved by half a percent. Frames are appended far faster than that, and
+/// every report redraws the editor on the main thread (#3075).
+private final class ProgressThrottle: @unchecked Sendable {
+    private static let interval: TimeInterval = 0.1
+    private static let step = 0.005
+    private let lock = NSLock()
+    private let forward: (Double) -> Void
+    private var lastValue = 0.0
+    private var lastTime = -TimeInterval.infinity
+
+    init(_ forward: @escaping (Double) -> Void) {
+        self.forward = forward
+    }
+
+    func report(_ value: Double) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        guard value - lastValue >= Self.step, now - lastTime >= Self.interval else {
+            lock.unlock()
+            return
+        }
+        lastValue = value
+        lastTime = now
+        lock.unlock()
+        forward(value)
     }
 }
 

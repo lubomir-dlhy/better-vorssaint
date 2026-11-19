@@ -8,8 +8,9 @@ import Combine
 /// Quits an app when its last window closes. Each regular app gets an
 /// Accessibility observer that
 /// watches windows being created and destroyed; when an app that had at least
-/// one window drops to zero standard windows, it's asked to quit (a normal
-/// terminate, so unsaved-changes dialogs still appear).
+/// one window drops to zero standard windows and shows nothing else on screen,
+/// it's asked to quit (a normal terminate, so unsaved-changes dialogs still
+/// appear).
 ///
 /// Predictable by design: apps that launch window-less are never touched, and
 /// any app can be kept running through the exception list. Requires
@@ -19,11 +20,14 @@ final class AutoQuitService: ObservableObject {
 
     /// Bundle ids never auto-quit; mirrors the persisted list for the UI.
     @Published private(set) var exceptions: [String] = []
+    /// Menu bar apps explicitly allowed to quit while they are in the Dock.
+    @Published private(set) var dockApps: [String] = []
 
     private static let appNotifications = [
         kAXWindowCreatedNotification,
         kAXMainWindowChangedNotification,
         kAXFocusedWindowChangedNotification,
+        kAXApplicationActivatedNotification,
         kAXApplicationDeactivatedNotification,
         kAXApplicationHiddenNotification,
         kAXApplicationShownNotification
@@ -37,6 +41,7 @@ final class AutoQuitService: ObservableObject {
         kAXWindowCreatedNotification as String,
         kAXWindowDeminiaturizedNotification as String,
         kAXApplicationShownNotification as String,
+        kAXApplicationActivatedNotification as String,
         kAXMainWindowChangedNotification as String,
         kAXFocusedWindowChangedNotification as String
     ])
@@ -49,6 +54,7 @@ final class AutoQuitService: ObservableObject {
     private var launchToken: NSObjectProtocol?
     private var terminateToken: NSObjectProtocol?
     private var activateToken: NSObjectProtocol?
+    private var spaceChangeToken: NSObjectProtocol?
     private var closeRequestTap: CFMachPort?
     private var closeRequestRunLoopSource: CFRunLoopSource?
     private var recentCloseButtonRequests: [pid_t: Date] = [:]
@@ -56,12 +62,22 @@ final class AutoQuitService: ObservableObject {
     /// Apps whose attach is waiting on a retry, so a second round never starts.
     private var retryingApps = Set<pid_t>()
     private var minimizedWindows: [pid_t: Set<CGWindowID>] = [:]
+    /// Apps with a refresh already waiting for the next run loop turn.
+    private var pendingRefreshes = Set<pid_t>()
+    private struct WindowWatchRetryState {
+        let origin: DispatchTime
+        var attemptsScheduled: Int
+        var pendingTimerID: UUID?
+    }
+    /// Refreshes that found the app eligible but had no window to watch.
+    private var windowWatchRetries: [pid_t: WindowWatchRetryState] = [:]
     private var appsWithUnresolvedMinimizedWindows = Set<pid_t>()
 
     private let closeRequestGrace: TimeInterval = 5
 
     private init() {
         reloadExceptions()
+        reloadDockApps()
     }
 
     var isRunning: Bool { running }
@@ -101,7 +117,14 @@ final class AutoQuitService: ObservableObject {
         activateToken = center.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
                                            object: nil, queue: .main) { [weak self] note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            self?.attach(app)
+            self?.handleAppActivated(app)
+        }
+        // AX cannot describe a window parked on another Space. Keep such apps
+        // dormant after the bounded retry round, then try them again when the
+        // visible Space changes instead of polling them for their lifetime.
+        spaceChangeToken = center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification,
+                                              object: nil, queue: .main) { [weak self] _ in
+            self?.rearmWindowWatchRetries()
         }
 
         for app in NSWorkspace.shared.runningApplications {
@@ -122,9 +145,11 @@ final class AutoQuitService: ObservableObject {
         if let launchToken { center.removeObserver(launchToken) }
         if let terminateToken { center.removeObserver(terminateToken) }
         if let activateToken { center.removeObserver(activateToken) }
+        if let spaceChangeToken { center.removeObserver(spaceChangeToken) }
         launchToken = nil
         terminateToken = nil
         activateToken = nil
+        spaceChangeToken = nil
         stopCloseRequestMonitor()
         // Snapshot the keys — detach(pid:) mutates the dictionary.
         for pid in Array(observers.keys) { detach(pid: pid) }
@@ -134,10 +159,24 @@ final class AutoQuitService: ObservableObject {
         lastScheduledChecks.removeAll()
         retryingApps.removeAll()
         minimizedWindows.removeAll()
+        pendingRefreshes.removeAll()
         appsWithUnresolvedMinimizedWindows.removeAll()
+        windowWatchRetries.removeAll()
     }
 
     // MARK: - Per-app observers
+
+    private func handleAppActivated(_ app: NSRunningApplication) {
+        guard running, app.activationPolicy == .regular else { return }
+        let pid = app.processIdentifier
+        guard pid != getpid() else { return }
+        if observers[pid] != nil {
+            scheduleRefresh(pid: pid)
+        } else {
+            retryingApps.remove(pid)
+            attach(app)
+        }
+    }
 
     private func attach(_ app: NSRunningApplication) {
         attach(app, attempt: 0)
@@ -154,16 +193,26 @@ final class AutoQuitService: ObservableObject {
 
         let appElement = AXUIElementCreateApplication(pid)
         // A launching app that is busy (say, blocked on a Keychain prompt)
-        // would hold every synchronous AX call below for the 6 second default
+        // would hold every synchronous AX call below for the default
         // timeout apiece, freezing the main thread and every event tap with
         // it: typing dies system wide (issue #189). Give up fast and retry
         // with growing spacing until the app services its run loop again.
         AXUIElementSetMessagingTimeout(appElement, 0.35)
-        var role: CFTypeRef?
-        if AXUIElementCopyAttributeValue(appElement, kAXRoleAttribute as CFString, &role) == .cannotComplete {
+        // The probe asks for windows rather than the application's role. A
+        // Chromium app (Electron, and the browsers) answers a role query on its
+        // application element by switching its renderers into full
+        // accessibility mode, and from then on it rebuilds and ships an
+        // accessibility tree on every DOM change for the life of the process —
+        // a few percent of a core, forever, in an app this feature only ever
+        // needed a window count from (issue #953). Windows are the same
+        // liveness signal, are what the refresh below reads anyway, and leave
+        // that mode alone; WindowEnumerator probes the same way.
+        var windows: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windows) == .cannotComplete {
             guard attempt < 6 else { retryingApps.remove(pid); return }
             retryingApps.insert(pid)
-            let delay = 5.0 * pow(2.0, Double(attempt))
+            let delays = [0.15, 0.4, 1.0, 2.5, 5.0, 10.0]
+            let delay = attempt < delays.count ? delays[attempt] : 5.0 * pow(2.0, Double(attempt))
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, self.running, !app.isTerminated else { return }
                 self.attach(app, attempt: attempt + 1)
@@ -197,7 +246,9 @@ final class AutoQuitService: ObservableObject {
         lastScheduledChecks[pid] = nil
         retryingApps.remove(pid)
         minimizedWindows[pid] = nil
+        pendingRefreshes.remove(pid)
         appsWithUnresolvedMinimizedWindows.remove(pid)
+        windowWatchRetries[pid] = nil
     }
 
     /// Called from the C observer callback (on the main run loop).
@@ -220,8 +271,8 @@ final class AutoQuitService: ObservableObject {
             clearMinimizedWindow(pid: pid, element: element)
         }
 
-        if Self.windowRefreshNotifications.contains(notification), let observer = observers[pid] {
-            refreshWindows(pid: pid, observer: observer)
+        if Self.windowRefreshNotifications.contains(notification), observers[pid] != nil {
+            scheduleRefresh(pid: pid)
         }
         let event = Self.autoQuitEvent(for: notification)
         if AutoQuitSupport.shouldScheduleWindowCheck(for: event,
@@ -239,6 +290,9 @@ final class AutoQuitService: ObservableObject {
         }
         if notification == (kAXApplicationDeactivatedNotification as String) {
             return .appDeactivated
+        }
+        if notification == (kAXApplicationActivatedNotification as String) {
+            return .appActivated
         }
         if notification == (kAXMainWindowChangedNotification as String) {
             return .mainWindowChanged
@@ -264,7 +318,18 @@ final class AutoQuitService: ObservableObject {
     /// there. A single look was a coin flip against that fade, and losing it
     /// meant the app was never asked to quit at all. Two more looks settle it,
     /// with room for slower machines.
-    private static let closeCheckDelays: [TimeInterval] = [0.35, 1.0, 2.2]
+    private static let closeCheckOffsets: [TimeInterval] = [0.35, 1.0, 2.2]
+
+    /// Accessibility can list no windows for an app the window server still
+    /// shows one for: it answers late for an app that is busy, and it cannot
+    /// describe a window parked on a Space that is not visible at all. Either
+    /// way the app is marked eligible with nothing to watch, so the close that
+    /// should quit it destroys a window nobody registered for and no check is
+    /// ever scheduled (issue #1008). Look again a few times: Accessibility
+    /// usually catches up within the first, and when it never does the retries
+    /// stop rather than polling for the life of the app. These are offsets from
+    /// the start of one retry round, not delays chained from each retry.
+    private static let windowWatchRetryOffsets: [TimeInterval] = [0.5, 1.5, 4.0]
 
     private func scheduleWindowChecks(pid: pid_t) {
         // Closing several windows at once (or a click plus the window going
@@ -273,8 +338,9 @@ final class AutoQuitService: ObservableObject {
         let now = Date()
         if let last = lastScheduledChecks[pid], now.timeIntervalSince(last) < 0.25 { return }
         lastScheduledChecks[pid] = now
-        for delay in Self.closeCheckDelays {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        let origin = DispatchTime.now()
+        for offset in Self.closeCheckOffsets {
+            DispatchQueue.main.asyncAfter(deadline: origin + offset) { [weak self] in
                 self?.checkWindows(pid: pid)
             }
         }
@@ -283,9 +349,11 @@ final class AutoQuitService: ObservableObject {
     private func checkWindows(pid: pid_t, confirm: Bool = true) {
         guard running, hadWindows[pid] == true,
               let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
-        let appIsExcepted = AutoQuitSupport.isExcepted(bundleIdentifier: app.bundleIdentifier,
-                                                       bundleURL: app.bundleURL,
-                                                       exceptions: exceptions)
+        let appIsExcepted = AutoQuitSupport.isQuitExempt(bundleIdentifier: app.bundleIdentifier,
+                                                        bundleURL: app.bundleURL,
+                                                        isInDock: app.activationPolicy == .regular,
+                                                        exceptions: exceptions,
+                                                        dockApps: dockApps)
         let hiddenByCloseRequest = app.isHidden && hasRecentCloseButtonRequest(pid: pid)
 
         // Cheap early-outs before any synchronous AX IPC: excepted apps and
@@ -295,7 +363,7 @@ final class AutoQuitService: ObservableObject {
 
         let appElement = AXUIElementCreateApplication(pid)
         // Bounded AX: an unresponsive app must not hold the main thread
-        // (and with it every event tap) for the 6 second default timeout.
+        // (and with it every event tap) for the default timeout.
         AXUIElementSetMessagingTimeout(appElement, 0.35)
         let hasMinimizedWindow = hasKnownMinimizedWindow(pid: pid, appElement: appElement)
         let hasVisibleWindow = hasUserFacingWindow(pid: pid, appElement: appElement)
@@ -354,24 +422,102 @@ final class AutoQuitService: ObservableObject {
             applicationBundleURLs: bundleURLs)
     }
 
+    /// Switching to an app fires activated, main window changed and focused
+    /// window changed one after the other, and each of them wants the same
+    /// refresh, which reads every window of the app synchronously. One per run
+    /// loop turn covers the burst. It has to stay that short: the refresh is
+    /// what marks an app as having had a window, and the close that quits it
+    /// can follow immediately.
+    private func scheduleRefresh(pid: pid_t) {
+        guard pendingRefreshes.insert(pid).inserted else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.pendingRefreshes.remove(pid) != nil, self.running,
+                  let observer = self.observers[pid] else { return }
+            self.refreshWindows(pid: pid, observer: observer)
+        }
+    }
+
     private func refreshWindows(pid: pid_t, observer: AXObserver) {
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, 0.35)
         let windows = standardWindows(of: appElement)
+        var watchedWindows = 0
         for window in windows {
-            watch(window: window, observer: observer, refcon: refcon)
+            if watch(window: window, observer: observer, refcon: refcon) { watchedWindows += 1 }
         }
         recordMinimizedWindows(pid: pid, windows: windows)
-        if !windows.isEmpty || hasWindowServerUserWindow(pid: pid) == true {
+        // The window-server scan is only needed when Accessibility handed us
+        // nothing.
+        let serverWindow = windows.isEmpty ? hasWindowServerUserWindow(pid: pid) : nil
+        let foundUserWindow = !windows.isEmpty || serverWindow == true
+        if foundUserWindow {
             hadWindows[pid] = true
+        }
+        // Every user window needs a destroy notification. Accessibility can
+        // list none despite the window server seeing one, or an individual
+        // registration can fail after the list succeeds. An app that has never
+        // yet shown any window also retries during its initial watch window so
+        // apps creating windows asynchronously on launch are caught.
+        if AutoQuitSupport.needsWindowWatchRetry(registeredWindows: watchedWindows,
+                                                 listedWindows: windows.count,
+                                                 foundUserWindow: foundUserWindow,
+                                                 hadPriorWindows: hadWindows[pid] == true) {
+            scheduleWindowWatchRetry(pid: pid)
+        } else {
+            windowWatchRetries[pid] = nil
         }
     }
 
-    private func watch(window: AXUIElement, observer: AXObserver, refcon: UnsafeMutableRawPointer) {
-        for notification in Self.windowNotifications {
-            AXObserverAddNotification(observer, window, notification as CFString, refcon)
+    private func scheduleWindowWatchRetry(pid: pid_t) {
+        var retry = windowWatchRetries[pid]
+            ?? WindowWatchRetryState(origin: .now(), attemptsScheduled: 0, pendingTimerID: nil)
+        guard retry.pendingTimerID == nil,
+              retry.attemptsScheduled < Self.windowWatchRetryOffsets.count else { return }
+        let attempt = retry.attemptsScheduled
+        let timerID = UUID()
+        retry.attemptsScheduled += 1
+        retry.pendingTimerID = timerID
+        windowWatchRetries[pid] = retry
+        DispatchQueue.main.asyncAfter(
+            deadline: retry.origin + Self.windowWatchRetryOffsets[attempt]
+        ) { [weak self] in
+            guard let self, self.running,
+                  var retry = self.windowWatchRetries[pid],
+                  retry.pendingTimerID == timerID,
+                  let observer = self.observers[pid] else { return }
+            retry.pendingTimerID = nil
+            self.windowWatchRetries[pid] = retry
+            self.refreshWindows(pid: pid, observer: observer)
         }
+    }
+
+    private func rearmWindowWatchRetries() {
+        // A new Space starts a new bounded round. Removing the state also makes
+        // any timer from the previous round stale before the immediate refresh.
+        for pid in Array(windowWatchRetries.keys) {
+            guard let observer = observers[pid] else {
+                windowWatchRetries[pid] = nil
+                continue
+            }
+            windowWatchRetries[pid] = nil
+            refreshWindows(pid: pid, observer: observer)
+        }
+    }
+
+    /// Reports whether the window ended up watched for the one notification the
+    /// close path depends on. Only the destroyed one schedules a check, so it
+    /// alone decides: a window that refused the miniaturize notifications is
+    /// still a window auto-quit can act on.
+    private func watch(window: AXUIElement, observer: AXObserver, refcon: UnsafeMutableRawPointer) -> Bool {
+        var watched = false
+        for notification in Self.windowNotifications {
+            let result = AXObserverAddNotification(observer, window, notification as CFString, refcon)
+            if notification == kAXUIElementDestroyedNotification {
+                watched = AutoQuitSupport.isWindowNotificationRegistered(result)
+            }
+        }
+        return watched
     }
 
     private func pidForObserver(_ observer: AXObserver) -> pid_t? {
@@ -384,21 +530,24 @@ final class AutoQuitService: ObservableObject {
         if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
            let windows = value as? [AXUIElement] {
             for window in windows {
-                AXUIElementSetMessagingTimeout(window, 0.35)
-                if Self.isStandardWindow(window) { Self.appendUnique(window, to: &result) }
+                Self.appendIfStandard(window, to: &result)
             }
         }
+        // The main and focused window are almost always in the list above, and
+        // deciding whether an element is a standard window costs two to four
+        // synchronous round trips into the app every time it is asked. Match
+        // against what is already collected first, ask only what is new.
         for attribute in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
             if let window = Self.windowAttribute(appElement, attribute as String) {
-                AXUIElementSetMessagingTimeout(window, 0.35)
-                if Self.isStandardWindow(window) { Self.appendUnique(window, to: &result) }
+                Self.appendIfStandard(window, to: &result)
             }
         }
         return result
     }
 
     /// A real, user-facing window — not a sheet, palette or system dialog, which
-    /// shouldn't keep an app "alive" for this purpose.
+    /// never makes an app eligible or gets watched. Whether one still on screen
+    /// keeps the app running is the window server check's call.
     private static func isStandardWindow(_ window: AXUIElement) -> Bool {
         if boolAttribute(window, "AXFullScreen") { return true }
         if boolAttribute(window, kAXMinimizedAttribute as String),
@@ -419,8 +568,10 @@ final class AutoQuitService: ObservableObject {
         return false
     }
 
-    private static func appendUnique(_ window: AXUIElement, to windows: inout [AXUIElement]) {
+    private static func appendIfStandard(_ window: AXUIElement, to windows: inout [AXUIElement]) {
         guard !windows.contains(where: { CFEqual($0, window) }) else { return }
+        AXUIElementSetMessagingTimeout(window, 0.35)
+        guard isStandardWindow(window) else { return }
         windows.append(window)
     }
 
@@ -447,7 +598,7 @@ final class AutoQuitService: ObservableObject {
         if axWindows.contains(where: { Self.boolAttribute($0, kAXMinimizedAttribute as String) }) {
             return true
         }
-        if let hasWindowServerWindow = hasWindowServerUserWindow(pid: pid) {
+        if let hasWindowServerWindow = hasWindowServerUserWindow(pid: pid, countsEverythingShown: true) {
             return hasWindowServerWindow
         }
         return !axWindows.isEmpty
@@ -458,45 +609,33 @@ final class AutoQuitService: ObservableObject {
     /// the feature, and plenty of them do not destroy their window on close:
     /// they hide it, which leaves the app with no windows for Accessibility but
     /// a window record here. Those do not count. A window sitting on another
-    /// Space does.
-    private func hasWindowServerUserWindow(pid: pid_t) -> Bool? {
+    /// Space does, and so does a minimized one. The check before a quit also
+    /// counts whatever else the app shows on screen (`countsEverythingShown`);
+    /// see `AutoQuitSupport.windowServerWindowRole`. The decision itself is
+    /// `AutoQuitSupport.windowListHasUserWindow`.
+    private func hasWindowServerUserWindow(pid: pid_t, countsEverythingShown: Bool = false) -> Bool? {
         guard let info = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements],
                                                     kCGNullWindowID) as? [[String: Any]] else { return nil }
+        return AutoQuitSupport.windowListHasUserWindow(
+            info,
+            pid: pid,
+            countsEverythingShown: countsEverythingShown,
+            processDrawsForApp: { Self.process($0, drawsFor: pid) },
+            windowIsMinimized: { SpaceWindowBridge.isMinimized($0) },
+            visibleSpaces: { SpaceWindowBridge.topology()?.visibleSpaces },
+            windowSpaces: { SpaceWindowBridge.resolvedSpaces(of: $0) })
+    }
 
-        var visibleSpaces: Set<UInt64>?
-        var askedForVisibleSpaces = false
-
-        for window in info {
-            guard let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-                  ownerPID == pid,
-                  let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue,
-                  layer == 0,
-                  (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1 > 0,
-                  let bounds = window[kCGWindowBounds as String] as? [String: Any],
-                  let width = (bounds["Width"] as? NSNumber)?.doubleValue,
-                  let height = (bounds["Height"] as? NSNumber)?.doubleValue,
-                  width >= 80, height >= 80 else { continue }
-            let isOnScreen = (window[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue
-                ?? (window[kCGWindowIsOnscreen as String] as? Bool)
-                ?? false
-            if isOnScreen { return true }
-
-            guard let windowID = (window[kCGWindowNumber as String] as? NSNumber)?.uint32Value else { continue }
-            // Asked once per check, and only when there is an off-screen window
-            // to judge: the common case never pays for it.
-            if !askedForVisibleSpaces {
-                visibleSpaces = SpaceWindowBridge.topology()?.visibleSpaces
-                askedForVisibleSpaces = true
-            }
-            let title = window[kCGWindowName as String] as? String ?? ""
-            if AutoQuitSupport.offscreenWindowKeepsAppAlive(
-                windowSpaces: SpaceWindowBridge.spaces(of: CGWindowID(windowID)),
-                visibleSpaces: visibleSpaces,
-                hasTitle: !title.isEmpty) {
-                return true
-            }
-        }
-        return false
+    /// Whether another process's window is this app's own interface drawn
+    /// elsewhere. Since macOS 10.15 every Open and Save panel is drawn in a
+    /// service the system starts for the app that asked, and AutoFill and
+    /// Quick Look work the same way; the system records that app as
+    /// responsible for the service. A regular app never counts, even one this
+    /// app started: a simulator opened from its IDE or a program run from a
+    /// terminal is an app of its own.
+    private static func process(_ processID: pid_t, drawsFor appPID: pid_t) -> Bool {
+        guard ResponsibleProcess.owner(of: processID) == appPID else { return false }
+        return NSRunningApplication(processIdentifier: processID)?.activationPolicy != .regular
     }
 
     // MARK: - Close-request monitor
@@ -532,6 +671,7 @@ final class AutoQuitService: ObservableObject {
         if let closeRequestRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), closeRequestRunLoopSource, .commonModes)
         }
+        if let closeRequestTap { CFMachPortInvalidate(closeRequestTap) }
         closeRequestTap = nil
         closeRequestRunLoopSource = nil
     }
@@ -559,11 +699,23 @@ final class AutoQuitService: ObservableObject {
               let candidate = WindowServerTrafficLightHitTest.candidate(
                 at: event.location,
                 button: .close,
-                pidIsEligible: { [weak self] pid in self?.observers[pid] != nil }
+                pidIsEligible: { [weak self] pid in
+                    guard let self else { return false }
+                    if self.observers[pid] != nil { return true }
+                    if let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular {
+                        self.retryingApps.remove(pid)
+                        self.attach(app)
+                        return self.observers[pid] != nil
+                    }
+                    return false
+                }
               ),
               AXIsProcessTrusted(),
               let pid = closeButtonPID(at: event.location, candidate: candidate) else {
             return Unmanaged.passUnretained(event)
+        }
+        if let observer = observers[pid] {
+            refreshWindows(pid: pid, observer: observer)
         }
         markCloseButtonRequest(pid: pid)
         return Unmanaged.passUnretained(event)
@@ -584,13 +736,20 @@ final class AutoQuitService: ObservableObject {
                 command: true, control: false)
         }
         guard isCloseShortcut,
-              let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
-              observers[pid] != nil else { return }
+              let app = NSWorkspace.shared.frontmostApplication,
+              app.activationPolicy == .regular else { return }
+        let pid = app.processIdentifier
+        if observers[pid] == nil {
+            retryingApps.remove(pid)
+            attach(app)
+        }
+        guard let observer = observers[pid] else { return }
         // Cmd+W may close only a tab, so it is a weak signal: re-check windows
         // shortly (a genuinely closed last window fails the check and quits),
         // but never unlock the hidden-app quit path — otherwise closing a tab
         // and hiding the app would terminate an app whose window (with all its
         // tabs) still exists.
+        refreshWindows(pid: pid, observer: observer)
         scheduleWindowChecks(pid: pid)
     }
 
@@ -664,31 +823,44 @@ final class AutoQuitService: ObservableObject {
 
     private func closeButtonPID(at point: CGPoint, candidate: TrafficLightCandidate) -> pid_t? {
         guard candidate.pid != getpid(), observers[candidate.pid] != nil else { return nil }
-        guard let element = elementAt(point: point),
-              let window = Self.topLevelWindow(from: element)
-        else { return candidate.pid }
+        let element = elementAt(point: point)
+        // When Accessibility cannot confirm the close button, only the click's
+        // place can, and the area that sent it here also covers the minimize
+        // button (issue #3249). An element Accessibility does name as another
+        // window button settles it the other way.
+        func unconfirmedClose() -> pid_t? {
+            guard WindowServerSupport.contains(point, inCloseButtonOf: candidate.frame) else { return nil }
+            if let element, Self.isOtherWindowButton(element) { return nil }
+            return candidate.pid
+        }
+        guard let element, let window = Self.topLevelWindow(from: element) else { return unconfirmedClose() }
 
         var pid: pid_t = 0
         AXUIElementGetPid(window, &pid)
-        if pid == 0 { return candidate.pid }
+        if pid == 0 { return unconfirmedClose() }
         guard pid == candidate.pid else { return nil }
 
         guard Self.isStandardWindow(window),
               let closeButton = Self.windowAttribute(window, kAXCloseButtonAttribute as String),
               Self.boolAttribute(closeButton, kAXEnabledAttribute as String, default: true),
               let buttonFrame = Self.frame(of: closeButton)
-        else { return candidate.pid }
+        else { return unconfirmedClose() }
 
         return buttonFrame.insetBy(dx: -4, dy: -4).contains(point) ? pid : nil
     }
 
+    private static func isOtherWindowButton(_ element: AXUIElement) -> Bool {
+        guard !isApplicationElement(element) else { return false }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &value) == .success
+        else { return false }
+        return AutoQuitSupport.isWindowButtonOtherThanClose(subrole: value as? String)
+    }
+
     private func elementAt(point: CGPoint) -> AXUIElement? {
         let system = AXUIElementCreateSystemWide()
-        // This runs while a click is being handled, and the app being asked is
-        // the one that was just told to close, which is exactly when an app
-        // stops answering. A short limit here means a slow answer is dropped
-        // rather than holding this app, and every tap it runs, still.
-        AXUIElementSetMessagingTimeout(system, 0.15)
+        // No cap here: on the system-wide element a timeout is the default for
+        // every question this process asks, whoever asks it (#938).
         var element: AXUIElement?
         guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &element) == .success
         else { return nil }
@@ -696,7 +868,23 @@ final class AutoQuitService: ObservableObject {
         return element
     }
 
+
+    /// An application element answers a role query by switching a Chromium app's
+    /// renderers into full accessibility mode for the rest of the process's life
+    /// (issue #953), so it must never be asked for one. Its own pid names it:
+    /// the element built from that pid is the same element, since Accessibility
+    /// compares by value rather than by identity. Asking each element for its
+    /// own pid also keeps this right where a parent chain crosses processes,
+    /// which a sentinel built once from the starting element would miss.
+    private static func isApplicationElement(_ element: AXUIElement) -> Bool {
+        var pid: pid_t = 0
+        AXUIElementGetPid(element, &pid)
+        guard pid != 0 else { return false }
+        return CFEqual(element, AXUIElementCreateApplication(pid))
+    }
+
     private static func topLevelWindow(from element: AXUIElement) -> AXUIElement? {
+        guard !isApplicationElement(element) else { return nil }
         if role(of: element) == (kAXWindowRole as String) { return element }
         if let window = windowAttribute(element, kAXWindowAttribute as String),
            role(of: window) == (kAXWindowRole as String) {
@@ -707,9 +895,16 @@ final class AutoQuitService: ObservableObject {
             return window
         }
 
+        // The chain above a window is the application element itself, so an
+        // element that never yields a window — a menu bar item, a detached
+        // palette — walks onto it. Asking that element for a role is what puts
+        // a Chromium app's renderers into full accessibility mode for the rest
+        // of the process's life (issue #953), so stop there instead: the walk
+        // already ends with no window in that case.
         var current = element
         for _ in 0..<8 {
             guard let parent = windowAttribute(current, kAXParentAttribute as String) else { return nil }
+            if isApplicationElement(parent) { return nil }
             if role(of: parent) == (kAXWindowRole as String) { return parent }
             current = parent
         }
@@ -784,6 +979,30 @@ final class AutoQuitService: ObservableObject {
 
     func isMandatoryException(_ bundleID: String) -> Bool {
         Defaults.mandatoryAutoQuitExceptionBundleIDs.contains(bundleID)
+    }
+
+    // MARK: - Explicit menu bar app choices
+
+    private func reloadDockApps() {
+        let raw = UserDefaults.standard.stringArray(forKey: DefaultsKey.autoQuitDockApps) ?? []
+        let sanitized = Defaults.sanitizedAutoQuitDockApps(raw)
+        if raw != sanitized {
+            UserDefaults.standard.set(sanitized, forKey: DefaultsKey.autoQuitDockApps)
+        }
+        dockApps = sanitized
+    }
+
+    func addDockApp(_ bundleID: String) {
+        let list = Defaults.sanitizedAutoQuitDockApps(dockApps + [bundleID])
+        guard list != dockApps else { return }
+        UserDefaults.standard.set(list, forKey: DefaultsKey.autoQuitDockApps)
+        reloadDockApps()
+    }
+
+    func removeDockApp(_ bundleID: String) {
+        let list = Defaults.sanitizedAutoQuitDockApps(dockApps.filter { $0 != bundleID })
+        UserDefaults.standard.set(list, forKey: DefaultsKey.autoQuitDockApps)
+        reloadDockApps()
     }
 }
 
