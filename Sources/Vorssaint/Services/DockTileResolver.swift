@@ -103,6 +103,7 @@ enum DockTileResolver {
         NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && !$0.isTerminated
                 && $0.bundleURL?.standardizedFileURL.path == bundlePath
+                && !ParallShortcutResolver.isLaunchedByShortcut($0)
         }
     }
 
