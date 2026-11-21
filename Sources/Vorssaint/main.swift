@@ -10,6 +10,9 @@ if let command = SettingsBackupSupport.command(in: CommandLine.arguments) {
 }
 
 SuperKeyMappingGuard.runIfRequestedAndExit()
+#if VORSSAINT_DEVELOPMENT
+VorstBrand.migrateLegacyInstallIfNeeded()
+#endif
 Defaults.register()
 let configuredFeatureKeys = SettingsBackup.applyConfigFileAtLaunch()
 NotchControlItem.keyboardLightIsSupported = { BrightnessService.keyboardLightIsSupported }

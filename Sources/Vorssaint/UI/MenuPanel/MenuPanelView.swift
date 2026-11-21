@@ -514,9 +514,14 @@ private struct MenuPanelHeader: View {
 
     var body: some View {
         ZStack {
-            BrandMark(width: 48, tint: markTint)
-                .frame(height: 28)
-                .accessibilityHidden(true)
+            HStack(spacing: 6) {
+                BrandMark(width: 18, tint: markTint)
+                    .accessibilityHidden(true)
+                Text(AppInfo.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(markTint)
+            }
+            .frame(height: 28)
 
             if AppInfo.isBeta {
                 HStack {

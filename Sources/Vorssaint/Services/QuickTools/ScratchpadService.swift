@@ -466,7 +466,7 @@ final class ScratchpadService: NSObject, ObservableObject, NSWindowDelegate {
                                            styleMask: [.borderless, .nonactivatingPanel, .resizable],
                                            backing: .buffered,
                                            defer: false)
-        panel.title = "Vorssaint"
+        panel.title = "Vorst"
         panel.isReleasedWhenClosed = false
         // Dragging inside the pad must select text, never move the window;
         // the header strip is the handle.

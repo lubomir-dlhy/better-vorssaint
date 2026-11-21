@@ -409,7 +409,7 @@ enum LocalizationFeatureContractTests {
         suite.expect(bundleLocalizations.contains("tr"), "Info.plist declares Turkish as a bundle localization")
         suite.expect(bundleLocalizations.contains("ko"), "Info.plist declares Korean as a bundle localization")
         let baseAudioPrompt = infoPlist?["NSAudioCaptureUsageDescription"] as? String ?? ""
-        suite.expect(baseAudioPrompt.contains("Vorssaint uses each app's audio"),
+        suite.expect(baseAudioPrompt.contains("Vorst uses each app's audio"),
                "base audio permission prompt is an English fallback")
         let organizerFolderPromptKeys = [
             "NSDesktopFolderUsageDescription", "NSDocumentsFolderUsageDescription",

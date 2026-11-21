@@ -497,7 +497,7 @@ final class SpacesOrderHold {
                     watch(isWanted)
                 }
             }
-            Self.log.info("Space rearranging was turned back on outside Vorssaint; fixed order turned off")
+            Self.log.info("Space rearranging was turned back on outside Vorst; fixed order turned off")
         }
     }
 

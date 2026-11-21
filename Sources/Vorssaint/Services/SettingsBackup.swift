@@ -14,7 +14,7 @@ enum SettingsBackup {
     @discardableResult
     static func runExportPanel() -> Bool? {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "Vorssaint Settings.plist"
+        panel.nameFieldStringValue = "Vorst Settings.plist"
         panel.allowedContentTypes = [.propertyList]
         panel.canCreateDirectories = true
         NSApp.activate(ignoringOtherApps: true)
@@ -203,7 +203,7 @@ enum SettingsBackup {
                 failCommand("quit the app before importing settings")
             }
             guard let settings = readSettings(at: URL(fileURLWithPath: path)) else {
-                failCommand("\(path) is not a valid Vorssaint backup")
+                failCommand("\(path) is not a valid Vorst backup")
             }
             Defaults.register()
             apply(settings: settings)

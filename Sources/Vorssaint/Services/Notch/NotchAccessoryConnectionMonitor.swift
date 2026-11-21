@@ -198,7 +198,7 @@ private final class NotchAccessoryBluetoothRunLoop {
         if let runLoop = action.runLoop { scheduleDrain(on: runLoop) }
         if action.launch {
             let thread = Thread { self.run() }
-            thread.name = "Vorssaint Bluetooth Accessories"
+            thread.name = "Vorst Bluetooth Accessories"
             thread.qualityOfService = .utility
             thread.start()
         }

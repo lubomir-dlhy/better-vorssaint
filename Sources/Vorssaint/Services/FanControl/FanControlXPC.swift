@@ -10,7 +10,7 @@ import CryptoKit
 enum FanControlIdentifiers {
     #if VORSSAINT_DEVELOPMENT
     static let teamID = "JKKTH6BN85"
-    static let appBundleID = "com.vorssaint.utils.dev"
+    static let appBundleID = "sk.dlhy.vorst"
     #else
     static let teamID = "3D485NHW29"
     static let appBundleID = "com.vorssaint.utils"

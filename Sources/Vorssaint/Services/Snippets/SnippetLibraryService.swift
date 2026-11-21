@@ -231,7 +231,7 @@ final class SnippetLibraryService: ObservableObject {
                                         styleMask: [.borderless, .nonactivatingPanel],
                                         backing: .buffered,
                                         defer: false)
-        panel.title = "Vorssaint"
+        panel.title = "Vorst"
         panel.isReleasedWhenClosed = false
         panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false

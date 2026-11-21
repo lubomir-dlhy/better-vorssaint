@@ -741,7 +741,9 @@ struct AboutSettings: View {
                 aboutContent
             }
 
-            UpdatesView()
+            if !AppInfo.isDeveloperBuild {
+                UpdatesView()
+            }
         }
         .formStyle(.grouped)
     }
@@ -785,7 +787,9 @@ struct AboutSettings: View {
                 Button(l10n.s.reviewHighlights) {
                     appDelegate()?.showUpdateHighlights(isReview: true)
                 }
-                Link(l10n.s.viewOnGitHub, destination: AppInfo.repositoryURL)
+                if !AppInfo.isDeveloperBuild {
+                    Link(l10n.s.viewOnGitHub, destination: AppInfo.repositoryURL)
+                }
             }
             Text(AppInfo.copyright)
                 .font(.caption2)

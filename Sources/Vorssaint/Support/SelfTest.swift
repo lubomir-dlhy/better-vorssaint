@@ -14,7 +14,7 @@ enum SelfTest {
         var assertionID = IOPMAssertionID(0)
         let result = IOPMAssertionCreateWithName("PreventUserIdleSystemSleep" as CFString,
                                                  IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                                                 "Vorssaint selftest" as CFString,
+                                                 "Vorst selftest" as CFString,
                                                  &assertionID)
         if result == kIOReturnSuccess {
             IOPMAssertionRelease(assertionID)

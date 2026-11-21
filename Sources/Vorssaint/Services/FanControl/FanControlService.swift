@@ -622,7 +622,7 @@ final class FanControlService: ObservableObject {
             guard processActivity == nil else { return }
             processActivity = ProcessInfo.processInfo.beginActivity(
                 options: .userInitiatedAllowingIdleSystemSleep,
-                reason: "Vorssaint fan control heartbeat"
+                reason: "Vorst fan control heartbeat"
             )
         } else if let processActivity {
             ProcessInfo.processInfo.endActivity(processActivity)

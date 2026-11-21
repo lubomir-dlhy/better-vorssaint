@@ -54,7 +54,7 @@ enum PointerTapRunLoop {
                 CFRunLoopRunInMode(.defaultMode, .greatestFiniteMagnitude, false)
             }
         }
-        thread.name = "Vorssaint Pointer Input"
+        thread.name = "Vorst Pointer Input"
         thread.qualityOfService = .userInteractive
         thread.start()
         // The wait orders the write above against the read below.
