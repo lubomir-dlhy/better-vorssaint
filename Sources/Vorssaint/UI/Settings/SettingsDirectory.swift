@@ -626,9 +626,10 @@ enum SettingsDirectory {
                 SettingsDirectoryItem(page: .about, title: s.tabAbout, icon: "info.circle",
                                       keywords: [s.reviewIntro, s.reviewHighlights]),
                 SettingsDirectoryItem(page: .releaseNotes, title: s.tabReleaseNotes, icon: "sparkles"),
+            ] + (AppInfo.isDeveloperBuild ? [] : [
                 SettingsDirectoryItem(page: .support, title: s.tabSupport, icon: "heart.fill",
                                       keywords: [s.donateButton, s.supportIntroStarButton]),
-            ]),
+            ])),
         ]
     }
 }

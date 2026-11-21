@@ -202,6 +202,8 @@ struct MixerSection: View {
                 Label {
                     Text(l10n.s.mixerSoundEffectsOutputTitle)
                         .font(.system(size: 11.5, weight: .medium))
+                        .lineLimit(1)
+                        .fixedSize()
                 } icon: {
                     Image(systemName: "bell.fill")
                         .font(.system(size: 10.5, weight: .semibold))

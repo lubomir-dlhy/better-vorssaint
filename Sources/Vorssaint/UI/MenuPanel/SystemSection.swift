@@ -457,6 +457,7 @@ struct SystemSection: View {
     private static let memoryFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .memory
+        formatter.allowsNonnumericFormatting = false
         return formatter
     }()
 

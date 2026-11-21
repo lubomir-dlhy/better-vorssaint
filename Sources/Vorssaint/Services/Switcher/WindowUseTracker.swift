@@ -254,7 +254,7 @@ final class WindowUseTracker {
             shouldStopWatcher = false
             pendingStartAfterStop = false
             let thread = Thread { [weak self] in self?.runWatcher() }
-            thread.name = "Vorssaint Window Focus"
+            thread.name = "Vorst Window Focus"
             thread.qualityOfService = .userInitiated
             watcherThread = thread
             return thread

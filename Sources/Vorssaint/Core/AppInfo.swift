@@ -6,11 +6,12 @@ import Foundation
 /// Static identity of the app, shared by UI, notifications and tooling.
 enum AppInfo {
     #if VORSSAINT_DEVELOPMENT
-    static let name = "Vorst"
+    static let name = VorstBrand.name
+    static let copyright = VorstBrand.credit
     #else
     static let name = "Vorssaint"
-    #endif
     static let copyright = "© 2026 Vorssaint"
+    #endif
     static let websiteURL = URL(string: "https://vorssaint.com")!
     static let repositoryURL = URL(string: "https://github.com/vorssaint/vorssaint-utils")!
     static let coffeeURL = URL(string: "https://buymeacoffee.com/vorssaint")!
@@ -23,10 +24,13 @@ enum AppInfo {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
     }
 
-    /// True for the local "Vorst" build (bundle id ends in `.dev`).
-    /// It is never published and never auto-updates; all work is tested here first.
+    /// True for the Vorst build, which never installs upstream updates.
     static var isDeveloperBuild: Bool {
+        #if VORSSAINT_DEVELOPMENT
+        true
+        #else
         (Bundle.main.bundleIdentifier ?? "").hasSuffix(".dev")
+        #endif
     }
 
     /// True when the current version is a pre-release (e.g. 3.3.4-beta.1 or 3.3.4-rc.1).

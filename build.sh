@@ -45,7 +45,7 @@ done
 if (( DEV )); then
     APP_NAME="Vorst"
     EXECUTABLE="Vorst"
-    APP_BUNDLE_ID="com.vorssaint.utils.dev"
+    APP_BUNDLE_ID="sk.dlhy.vorst"
     BUILD_VARIANT_FLAGS=(-D VORSSAINT_DEVELOPMENT)
     APP_OPTIMIZATION_FLAGS=(-Onone)
     BUILD_CONFIGURATION="debug"
@@ -673,7 +673,10 @@ xattr -c -r build/AppIcon.iconset build/AppIcon.icns build/MenuBarIcon.png build
 ACTOOL_BIN="$(xcrun --find actool 2>/dev/null || true)"
 ICON_TMP="$(mktemp -d)"
 ADAPTIVE_SKIP=""
-if [[ -z "$ACTOOL_BIN" ]]; then
+if (( DEV )); then
+    ADAPTIVE_SKIP="Vorst ships its flat icon"
+    rm -f build/Assets.car
+elif [[ -z "$ACTOOL_BIN" ]]; then
     ADAPTIVE_SKIP="actool not found (adaptive icons need Xcode 26+)"
 else
     echo "▸ Compiling adaptive icon catalog…"
