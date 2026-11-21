@@ -307,17 +307,17 @@ final class UpdateService: ObservableObject {
     }
 
     /// Hands the swap to a detached shell script: it waits for this process to
-    /// quit, mounts the DMG, replaces the bundle, clears quarantine and
-    /// relaunches. Running it outside the app means the bundle can be replaced
-    /// safely while we exit. When the app's folder is not writable by this
-    /// user (standard account with the app in /Applications), the script runs
-    /// through an admin prompt instead of failing silently.
+    /// quit, verifies and mounts the DMG, replaces the bundle, clears
+    /// quarantine and relaunches. Running it outside the app means the bundle
+    /// can be replaced safely while we exit. When the app's folder is not
+    /// writable by this user (standard account with the app in /Applications),
+    /// the script runs through an admin prompt instead of failing silently.
     private func launchInstaller(dmgPath: String, offered: String?) {
         let appPath = Bundle.main.bundlePath
         let pid = ProcessInfo.processInfo.processIdentifier
         let fm = FileManager.default
 
-        guard let resultURL = Self.installResultURL else {
+        guard let resultURL = Self.installResultURL, let expectedVersion = offered else {
             abortInstall(dmgPath: dmgPath, offered: offered)
             return
         }
@@ -331,18 +331,18 @@ final class UpdateService: ObservableObject {
         if fm.isWritableFile(atPath: appDirectory),
            !UpdateInstallerSupport.shouldForceAdminInstall(afterFailureCode: lastFailure) {
             launchUserInstaller(appPath: appPath, dmgPath: dmgPath, pid: pid,
-                                resultPath: resultURL.path, offered: offered)
+                                resultPath: resultURL.path, expectedVersion: expectedVersion)
         } else {
             // Either the folder is not writable, or the last attempt died at
             // the copy/swap step: retry with admin rights instead of failing
             // the same way twice.
             launchAdminInstaller(appPath: appPath, dmgPath: dmgPath, pid: pid,
-                                 resultPath: resultURL.path, offered: offered)
+                                 resultPath: resultURL.path, expectedVersion: expectedVersion)
         }
     }
 
     private func launchUserInstaller(appPath: String, dmgPath: String, pid: Int32,
-                                     resultPath: String, offered: String?) {
+                                     resultPath: String, expectedVersion: String) {
         let scriptURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("vorssaint-update-\(pid)-\(UUID().uuidString).sh")
         do {
@@ -353,11 +353,12 @@ final class UpdateService: ObservableObject {
             return
         }
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = [scriptURL.path, appPath, dmgPath, "\(pid)", resultPath, "\(getuid())"]
         do {
-            try task.run()
+            // Its own session: a plain child would be swept away with this
+            // app's session and launchd job, before the swap it is here for.
+            try DetachedProcess.spawn("/bin/sh",
+                                      [scriptURL.path, appPath, dmgPath, "\(pid)", resultPath,
+                                       "\(getuid())", expectedVersion])
         } catch {
             try? FileManager.default.removeItem(at: scriptURL)
             failInstall(dmgPath: dmgPath, message: error.localizedDescription)
@@ -372,25 +373,34 @@ final class UpdateService: ObservableObject {
     /// Same installer, behind the system admin prompt via AdminShell, which
     /// serializes prompts and brings this menu bar app forward so the dialog
     /// cannot open behind another window. The script goes inline inside the
-    /// elevated command (never a user-writable file run as root), detached
-    /// with nohup so the prompt returns while the installer waits for our
-    /// exit.
+    /// elevated command (never a user-writable file run as root), started in
+    /// its own session so the prompt returns while the installer waits for our
+    /// exit — and so it survives that exit.
     private func launchAdminInstaller(appPath: String, dmgPath: String, pid: Int32,
-                                      resultPath: String, offered: String?) {
+                                      resultPath: String, expectedVersion: String) {
         let command = UpdateInstallerSupport.elevatedInstallCommand(appPath: appPath,
                                                                     dmgPath: dmgPath,
                                                                     pid: pid,
                                                                     resultPath: resultPath,
-                                                                    uid: getuid())
+                                                                    uid: getuid(),
+                                                                    expectedVersion: expectedVersion)
+        // The in-process authorization holds the main thread until it is
+        // answered, and the system dialog never appears while the Extra
+        // Brightness overlay is on screen (#1917). Once the request waits,
+        // nothing can take the overlay down, not even the menu, so it
+        // leaves first and returns if the prompt is declined; an approved
+        // install quits.
+        ExtraBrightnessService.shared.stop()
         AdminShell.runInProcess(command, prompt: L10n.shared.s.adminPromptUpdate) { [weak self] granted in
             DispatchQueue.main.async {
                 guard let self else { return }
                 if granted {
                     NSApp.terminate(nil)
                 } else {
+                    ExtraBrightnessService.shared.syncWithPreferences()
                     // The user dismissed the admin prompt: keep the offer so
                     // the button simply works again.
-                    self.abortInstall(dmgPath: dmgPath, offered: offered)
+                    self.abortInstall(dmgPath: dmgPath, offered: expectedVersion)
                 }
             }
         }
@@ -472,7 +482,10 @@ final class UpdateService: ObservableObject {
     }
 }
 
-private final class BoundedUpdateDownloadDelegate: NSObject, URLSessionDataDelegate {
+/// Writes a response to a scratch file and abandons it once it passes
+/// `byteLimit`, so a body that never ends cannot fill the disk. Shared by the
+/// app update download and the What's New showcase video.
+final class BoundedUpdateDownloadDelegate: NSObject, URLSessionDataDelegate {
     private let byteLimit: Int64
     private let progress: (Int64, Int64?) -> Void
     private let completion: (URL?, URLResponse?, Error?) -> Void

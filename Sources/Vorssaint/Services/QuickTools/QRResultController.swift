@@ -91,6 +91,7 @@ final class QRResultController {
     private func copy(_ payload: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
+        pasteboard.declareVorssaintSource()
         pasteboard.setString(payload, forType: .string)
         close()
         QuickToolHUD.show(icon: "qrcode", message: L10n.shared.s.ocrQRCopied)
@@ -127,7 +128,7 @@ final class QRResultController {
 
 /// A non-activating panel that can still take key focus so its buttons and
 /// selectable text respond without bringing the whole app forward.
-private final class QRResultPanel: NSPanel {
+private final class QRResultPanel: OverlayPanel {
     override var canBecomeKey: Bool { true }
 }
 
@@ -189,13 +190,4 @@ private struct QRResultView: View {
                 .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
         )
     }
-}
-
-/// Erases the two button styles used above so they can share one modifier.
-private struct AnyButtonStyle: PrimitiveButtonStyle {
-    private let make: (Configuration) -> AnyView
-    init(_ style: some PrimitiveButtonStyle) {
-        make = { AnyView(Button($0).buttonStyle(style)) }
-    }
-    func makeBody(configuration: Configuration) -> some View { make(configuration) }
 }

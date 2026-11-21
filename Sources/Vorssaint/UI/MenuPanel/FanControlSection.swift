@@ -11,9 +11,11 @@ struct FanControlSection: View {
         FanControlPolicy.defaultCoolingLevel
     @AppStorage(DefaultsKey.fanControlCurves) private var curvesStorage =
         FanControlConfiguration.defaultCurvesStorage
+    @AppStorage(DefaultsKey.fanControlResume) private var resume = false
     @AppStorage(DefaultsKey.temperatureUnit) private var temperatureUnit =
         TemperatureUnit.celsius.rawValue
     var collapsible = true
+    var fallbackFanSpeeds: [Double] = []
 
     private var strings: FanControlFeatureStrings {
         FeatureStrings.fanControl(l10n.language)
@@ -24,26 +26,33 @@ struct FanControlSection: View {
             FanControlCardContent(strings: strings,
                                   betaLabel: l10n.s.betaBadge,
                                   snapshot: service.snapshot,
+                                  fallbackFanSpeeds: fallbackFanSpeeds,
                                   accessState: service.accessState,
                                   error: service.error,
                                   isWorking: service.isWorking,
+                                  resumeFailed: service.resumeFailed,
                                   mode: modeBinding,
                                   coolingLevel: $coolingLevel,
                                   curves: curvesBinding,
+                                  resume: $resume,
                                   temperatureUnit: displayTemperatureUnit,
                                   authorize: service.authorize,
                                   applyConfiguration: service.applyConfiguration,
-                                  stopCooling: service.restoreAutomatic)
+                                  stopCooling: service.returnToSystem)
                 .panelCard()
                 .onAppear { service.panelDidAppear() }
                 .onDisappear { service.panelDidDisappear() }
+                .onChange(of: resume) { _, _ in service.resumePreferenceDidChange() }
         }
     }
 
     private var modeBinding: Binding<FanControlMode> {
         Binding(
             get: { FanControlMode(rawValue: modeRaw) ?? .system },
-            set: { modeRaw = $0.rawValue }
+            set: { selection in
+                modeRaw = selection.rawValue
+                if selection == .system { service.forgetResume() }
+            }
         )
     }
 
@@ -72,12 +81,15 @@ struct FanControlCardContent: View {
     let strings: FanControlFeatureStrings
     let betaLabel: String
     let snapshot: FanControlSnapshot
+    let fallbackFanSpeeds: [Double]
     let accessState: FanControlService.AccessState
     let error: FanControlErrorCode?
     let isWorking: Bool
+    var resumeFailed = false
     @Binding var mode: FanControlMode
     @Binding var coolingLevel: Int
     @Binding var curves: [FanControlCurve]
+    @Binding var resume: Bool
     let temperatureUnit: TemperatureUnit
     let authorize: () -> Void
     let applyConfiguration: (FanControlConfiguration) -> Void
@@ -87,7 +99,12 @@ struct FanControlCardContent: View {
         VStack(alignment: .leading, spacing: 10) {
             statusHeader
 
-            if !snapshot.fans.isEmpty { fanRows }
+            if !fallbackFanSpeeds.isEmpty,
+               snapshot.fans.isEmpty || error == .helperUnavailable {
+                fallbackFanRows
+            } else if !snapshot.fans.isEmpty {
+                fanRows
+            }
 
             if let sensors = snapshot.sensors, !sensors.isEmpty {
                 sensorRows(sensors)
@@ -123,6 +140,13 @@ struct FanControlCardContent: View {
             }
 
             action
+
+            if canConfigure, mode != .system {
+                Toggle(strings.resumeAfterRestart, isOn: $resume)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+            }
 
             if controlsCanAppear {
                 Text(strings.safetyCaption)
@@ -320,6 +344,23 @@ struct FanControlCardContent: View {
         return ("thermometer.medium", .orange)
     }
 
+    private var fallbackFanRows: some View {
+        VStack(spacing: 5) {
+            ForEach(fallbackFanSpeeds.indices, id: \.self) { index in
+                HStack(spacing: 6) {
+                    Text(String(format: strings.fanNameFormat, index + 1))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(format: strings.currentRPMFormat,
+                                Int(fallbackFanSpeeds[index].rounded())))
+                        .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                }
+            }
+        }
+        .padding(.vertical, 1)
+    }
+
     @ViewBuilder
     private var action: some View {
         if error == .noFans || error == .unsupportedHardware || error == .alreadyControlled {
@@ -396,12 +437,16 @@ struct FanControlCardContent: View {
         switch error {
         case .alreadyControlled: return strings.alreadyControlled
         case .unsupportedHardware: return strings.unsupported
-        case .helperUnavailable, .controlFailed: return strings.failed
+        case .helperUnavailable: return strings.helperUnavailable
+        case .controlFailed: return strings.failed
         case .authorizationRequired: return strings.approvalCaption
         case .noFans, .none: break
         }
         if accessState == .notRegistered, !snapshot.fans.isEmpty { return strings.approvalCaption }
         if accessState == .requiresApproval { return strings.approvalCaption }
+        // The kept curve or speed could not be brought back after a wake or a
+        // safety stop. Without this the card reads as if it were still running.
+        if resumeFailed, !snapshot.isCooling { return strings.failed }
         switch snapshot.stopReason {
         case .temperatureUnavailable: return strings.temperatureUnavailable
         case .timeLimit, .appDisconnected, .heartbeatLost, .hardwareChanged,
@@ -413,6 +458,7 @@ struct FanControlCardContent: View {
     }
 
     private var messageIsError: Bool {
+        if resumeFailed, !snapshot.isCooling { return true }
         switch error {
         case .alreadyControlled, .unsupportedHardware, .helperUnavailable, .controlFailed:
             return true

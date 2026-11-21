@@ -23,7 +23,8 @@ extension RecorderComposer {
                          sourceSize: CGSize,
                          frameRate: Int,
                          duration: Double,
-                         outputScale: CGFloat = 1) -> Plan? {
+                         outputScale: CGFloat = 1,
+                         outputFormat: RecorderSupport.ExportFormat = .video) -> Plan? {
         guard sourceSize.width > 0, sourceSize.height > 0, duration > 0 else { return nil }
 
         let style = document.resolvedBackdrop
@@ -34,24 +35,35 @@ extension RecorderComposer {
                                                     padding: padding,
                                                     aspect: aspect,
                                                     cropsToAspect: !hasBackdrop)
-        let scale = outputScale.isFinite ? min(1, max(0.1, outputScale)) : 1
-        let canvas = scale == 1
-            ? fullCanvas
-            : RecorderSupport.evenSize(CGSize(width: fullCanvas.width * scale,
-                                              height: fullCanvas.height * scale))
+        let scale = outputScale.isFinite ? min(1, max(0.01, outputScale)) : 1
+        let canvas: CGSize
+        if outputFormat == .gif {
+            canvas = RecorderSupport.gifOutputSize(source: fullCanvas,
+                scalePercent: Int((scale * 100).rounded()))
+        } else {
+            canvas = scale == 1 ? fullCanvas : RecorderSupport.evenSize(
+                CGSize(width: fullCanvas.width * scale, height: fullCanvas.height * scale))
+        }
         let card = RecorderSupport.cardRect(
             canvas: canvas,
             source: sourceSize,
             padding: padding,
-            fillsCanvas: !hasBackdrop && aspect != .original)
+            // Even output dimensions can slightly change the aspect ratio.
+            // Without a backdrop, cover the canvas rather than introducing
+            // transparent edge pixels that force full GIF frame redraws.
+            fillsCanvas: !hasBackdrop)
 
         let showsPointer = document.showsPointer && !track.samples.isEmpty
         let segments = document.activeZoomSegments(duration: duration)
-        let needsCanvas = hasBackdrop || fullCanvas != RecorderSupport.evenSize(sourceSize)
+        let changesCanvas = hasBackdrop || fullCanvas != RecorderSupport.evenSize(sourceSize)
+        let needsCanvas = scale != 1 || changesCanvas
         let hasCuts = !document.cuts.isEmpty
         let texts = RecorderTextOverlay.normalized(document.texts, duration: duration)
-        guard showsPointer || !segments.isEmpty || needsCanvas || hasCuts || !texts.isEmpty
-        else { return nil }
+        let images = RecorderImageOverlay.normalized(document.images, duration: duration)
+        let blurs = RecorderBlurRegion.normalized(document.blurs, duration: duration)
+        let hasEdits = showsPointer || !segments.isEmpty || changesCanvas || hasCuts
+            || !texts.isEmpty || !images.isEmpty || !blurs.isEmpty
+        guard hasEdits || scale != 1 else { return nil }
 
         // Everything the pointer track knows is in the RECORDING's own time,
         // and every frame drawn is in the FINISHED video's time. The path is
@@ -122,6 +134,9 @@ extension RecorderComposer {
             var amountTargets = [Double](repeating: 1, count: frames)
             var travelX = [Double](repeating: 0.5, count: frames)
             var travelY = [Double](repeating: 0.5, count: frames)
+            // `sourceTimes` is ascending, so each lookup walks its list once
+            // across the loop instead of once per frame.
+            var focusCursor = 0
             for index in 0..<frames {
                 let time = sourceTimes[index]
                 let state = RecorderTimeline.zoomState(at: time, segments: segments)
@@ -135,7 +150,9 @@ extension RecorderComposer {
                     travelY[index] = RecorderMotion.travelParameter(exactFocus: Double(aimed.y),
                                                                     zoom: state.amount)
                 } else {
-                    let focus = RecorderMotion.focus(at: time, clusters: clusters)
+                    let focus = RecorderMotion.focus(at: time,
+                                                     clusters: clusters,
+                                                     cursor: &focusCursor)
                     travelX[index] = RecorderMotion.travelParameter(focus: Double(focus.x))
                     travelY[index] = RecorderMotion.travelParameter(focus: Double(focus.y))
                 }
@@ -165,11 +182,17 @@ extension RecorderComposer {
         var pressScale = [Double](repeating: 1, count: frames)
         var ring = [Double](repeating: -1, count: frames)
         if showsPointer {
+            var punchCursor = 0
+            var ringCursor = 0
             for index in 0..<frames {
                 let time = sourceTimes[index]
-                pressScale[index] = RecorderMotion.pressScale(at: time, clicks: track.clicks)
+                pressScale[index] = RecorderMotion.pressScale(at: time,
+                                                              clicks: track.clicks,
+                                                              cursor: &punchCursor)
                 if document.showsClickRing,
-                   let progress = RecorderMotion.ringProgress(at: time, clicks: track.clicks) {
+                   let progress = RecorderMotion.ringProgress(at: time,
+                                                              clicks: track.clicks,
+                                                              cursor: &ringCursor) {
                     ring[index] = progress
                 }
             }
@@ -179,6 +202,23 @@ extension RecorderComposer {
         if !texts.isEmpty {
             textOpacity = texts.map { overlay in
                 (0..<frames).map { overlay.opacity(at: sourceTimes[$0]) }
+            }
+        }
+
+        var imageOpacity: [[Double]] = []
+        var imageSprites: [CGImage?] = []
+        if !images.isEmpty {
+            imageOpacity = images.map { overlay in
+                (0..<frames).map { overlay.opacity(at: sourceTimes[$0]) }
+            }
+            // Read and resized here, once, at the canvas this plan draws on.
+            imageSprites = images.map { RecorderImageRenderer.image(for: $0, canvas: canvas) }
+        }
+
+        var blurCovers: [[Bool]] = []
+        if !blurs.isEmpty {
+            blurCovers = blurs.map { region in
+                (0..<frames).map { region.covers(sourceTimes[$0]) }
             }
         }
 
@@ -194,6 +234,7 @@ extension RecorderComposer {
 
         return Plan(sourceSize: RecorderSupport.evenSize(sourceSize),
                     canvasSize: canvas,
+                    isScaleOnly: !hasEdits,
                     cardRect: card,
                     frameRate: frameRate,
                     positions: positions,
@@ -221,7 +262,13 @@ extension RecorderComposer {
                     plate: plate,
                     mask: mask,
                     texts: texts,
-                    textOpacity: textOpacity)
+                    textOpacity: textOpacity,
+                    textCanvasSize: outputFormat == .gif ? fullCanvas : canvas,
+                    images: images,
+                    imageSprites: imageSprites,
+                    imageOpacity: imageOpacity,
+                    blurs: blurs,
+                    blurCovers: blurCovers)
     }
 
     // MARK: - Plate

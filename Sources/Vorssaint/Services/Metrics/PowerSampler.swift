@@ -9,7 +9,7 @@ import IOKit.ps
 /// desktop may expose no SMC power key, so the UI shows only what is real.
 struct PowerReading {
     var systemWatts: Double?       // total the Mac is consuming (SMC PSTR)
-    var adapterWatts: Double?      // real-time draw from the adapter (SMC PDTR)
+    var adapterWatts: Double?      // adapter input, including connected devices (SMC PDTR or desktop PD0R)
     var adapterMaxWatts: Double?   // the charger's rated wattage
     var batteryWatts: Double?      // + charging, - discharging
     var chargePercent: Int?        // current charge level
@@ -33,24 +33,34 @@ struct PowerReading {
 final class PowerSampler {
     /// Internal-battery presence is immutable for the lifetime of a Mac boot.
     /// Resolve it once so desktops do not keep probing a service they cannot have.
-    static let hasInternalBattery: Bool = {
+    static var hasInternalBattery: Bool { batteryPresence.installed }
+
+    /// Apple silicon desktops publish the battery service too, with
+    /// BatteryInstalled false: it reports the power connection, not a battery.
+    private static let batteryPresence: (service: Bool, installed: Bool) = {
         let service = IOServiceGetMatchingService(kIOMainPortDefault,
                                                   IOServiceMatching("AppleSmartBattery"))
-        guard service != 0 else { return false }
-        IOObjectRelease(service)
-        return true
+        guard service != 0 else { return (false, false) }
+        defer { IOObjectRelease(service) }
+        let installed = IORegistryEntryCreateCFProperty(service, "BatteryInstalled" as CFString,
+                                                        kCFAllocatorDefault, 0)?.takeRetainedValue()
+        return (true, (installed as? Bool) != false)
     }()
 
     private let smc: SMCClient?
     private var systemKey: SMCClient.Key?
     private var adapterKey: SMCClient.Key?
+    private var dcInRailKey: SMCClient.Key?
     private var resolvedKeys = false
     private var batteryService: io_service_t = 0
 
     /// `PSTR` = System Total Power. `PDTR` = DC-In (adapter) Total Power.
     /// They stay separate because adapter input can include connected devices.
+    /// `PD0R` is the DC-In rail. The Mac Studio (Mac17,15) reports 0 W for PDTR,
+    /// so a Mac without a battery can use the rail as an adapter-input fallback.
     private static let systemPowerKey = "PSTR"
     private static let adapterPowerKey = "PDTR"
+    private static let dcInRailPowerKey = "PD0R"
 
     init(smc: SMCClient?) {
         self.smc = smc
@@ -64,20 +74,34 @@ final class PowerSampler {
 
     func sample() -> PowerReading {
         var reading = PowerReading()
+        var dcInRailWatts: Double?
 
         if let smc {
             if !resolvedKeys {
                 resolvedKeys = true
                 systemKey = smc.key(named: Self.systemPowerKey)
                 adapterKey = smc.key(named: Self.adapterPowerKey)
+                if !Self.hasInternalBattery {
+                    dcInRailKey = smc.key(named: Self.dcInRailPowerKey)
+                }
             }
             reading.systemWatts = plausibleWatts(systemKey)
             reading.adapterWatts = plausibleWatts(adapterKey)
+            if reading.adapterWatts == nil {
+                dcInRailWatts = plausibleWatts(dcInRailKey)
+            }
         }
 
-        if let props = batteryProperties() {
-            reading.hasBattery = true
+        let props = batteryProperties()
+        if let props {
             reading.externalConnected = (props["ExternalConnected"] as? Bool) ?? false
+            if let adapter = props["AdapterDetails"] as? [String: Any],
+               let rated = adapter["Watts"] as? Int, rated > 0 {
+                reading.adapterMaxWatts = Double(rated)
+            }
+        }
+        if Self.hasInternalBattery, let props {
+            reading.hasBattery = true
             reading.isCharging = (props["IsCharging"] as? Bool) ?? false
             reading.timeRemainingSeconds = BatteryTimeSupport.remainingSeconds(
                 timeToEmptyMinutes: timeToEmptyMinutes(),
@@ -89,11 +113,6 @@ final class PowerSampler {
             if voltageMv > 0, amperageMa != 0 {
                 // Power = V x I, signed by the amperage (negative while discharging).
                 reading.batteryWatts = (Double(voltageMv) / 1000.0) * (Double(amperageMa) / 1000.0)
-            }
-
-            if let adapter = props["AdapterDetails"] as? [String: Any],
-               let rated = adapter["Watts"] as? Int, rated > 0 {
-                reading.adapterMaxWatts = Double(rated)
             }
 
             if let capacity = props["CurrentCapacity"] as? Int,
@@ -122,6 +141,11 @@ final class PowerSampler {
             }
         }
 
+        reading.adapterWatts = MetricFormat.adapterPowerWatts(
+            measured: reading.adapterWatts,
+            dcInRailWatts: dcInRailWatts,
+            hasInternalBattery: Self.hasInternalBattery,
+            externalConnected: reading.externalConnected)
         reading.systemWatts = MetricFormat.systemPowerWatts(
             measured: reading.systemWatts,
             batteryWatts: reading.batteryWatts,
@@ -195,7 +219,7 @@ final class PowerSampler {
     }
 
     private func resolvedBatteryService() -> io_service_t {
-        guard Self.hasInternalBattery else { return 0 }
+        guard Self.batteryPresence.service else { return 0 }
         if batteryService != 0 { return batteryService }
         batteryService = IOServiceGetMatchingService(kIOMainPortDefault,
                                                      IOServiceMatching("AppleSmartBattery"))

@@ -7,14 +7,19 @@ import AppKit
 /// the user's order and the per-item visibility keys.
 enum QuickToggleAction: String, PanelOrderItem, Identifiable {
     // Case order is the default panel order: the appearance switch leads
-    // because it is the tab's headline action (issue request).
-    case darkMode, keyboardLight, micMute, emptyTrash, ejectDisks, hiddenFiles, desktopIcons,
-         lockScreen, displayOff, screenSaver
+    // because it is the tab's headline action (issue request). Quit all sits
+    // next to Empty the Trash (issue #855).
+    case darkMode, keyboardLight, micMute, emptyTrash, quitAllApps, ejectDisks, hiddenFiles,
+         desktopIcons, lockScreen, displayOff, screenSaver
 
     var id: String { rawValue }
 
     var feature: AppFeature {
-        self == .micMute ? .micMute : .quickToggles
+        switch self {
+        case .micMute: return .micMute
+        case .quitAllApps: return .quitApps
+        default: return .quickToggles
+        }
     }
 }
 
@@ -32,13 +37,43 @@ final class QuickTogglesService: ObservableObject {
     }
 
     @Published private(set) var states: [QuickToggleAction: RunState] = [:]
+    @Published private(set) var shortcutRegistrationFailed = false
+    @Published private(set) var othersShortcutRegistrationFailed = false
+    @Published private(set) var quitAllExceptions: [String] = []
 
     private let workQueue = DispatchQueue(label: "com.vorssaint.utils.quick-toggles", qos: .userInitiated)
+    private let hotkey = QuickToolHotkey(id: 63)
+    private let othersHotkey = QuickToolHotkey(id: 62)
 
-    private init() {}
+    private init() {
+        hotkey.onPress = { [weak self] in self?.showQuitApps(scope: .all) }
+        othersHotkey.onPress = { [weak self] in self?.showQuitApps(scope: .allExceptFront) }
+        reloadQuitAllExceptions()
+    }
 
     func state(for action: QuickToggleAction) -> RunState? {
         states[action]
+    }
+
+    func syncWithPreferences() {
+        let available = quitAppsAvailable
+        let defaults = UserDefaults.standard
+        shortcutRegistrationFailed = !hotkey.sync(
+            enabled: available && defaults.bool(forKey: DefaultsKey.quitAppsShortcutEnabled),
+            shortcut: GlobalShortcut.saved(for: DefaultsKey.quitAppsShortcut,
+                                           fallback: .quitAllDefault),
+            storageKey: DefaultsKey.quitAppsShortcut)
+        othersShortcutRegistrationFailed = !othersHotkey.sync(
+            enabled: available && defaults.bool(forKey: DefaultsKey.quitAppsExceptFrontShortcutEnabled),
+            shortcut: GlobalShortcut.saved(for: DefaultsKey.quitAppsExceptFrontShortcut,
+                                           fallback: .quitAllExceptFrontDefault),
+            storageKey: DefaultsKey.quitAppsExceptFrontShortcut)
+        if !available {
+            hotkey.unregister()
+            othersHotkey.unregister()
+            QuitAppsPanelController.shared.close()
+        }
+        reloadQuitAllExceptions()
     }
 
     // MARK: - Current system state (read on demand, never observed)
@@ -91,8 +126,10 @@ final class QuickTogglesService: ObservableObject {
         alert.informativeText = strings.emptyTrashConfirmMessage
         alert.addButton(withTitle: strings.emptyTrashConfirmButton)
         alert.addButton(withTitle: L10n.shared.s.uninstallerCancel)
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let island = NotchService.shared.presentationWindow
+        let fromIsland = island?.isVisible == true
+            && (NSApp.currentEvent?.window === island || NSApp.keyWindow === island)
+        guard NotchIslandAlert.run(alert, above: fromIsland ? island : nil) == .alertFirstButtonReturn else { return }
         emptyTrashConfirmed()
     }
 
@@ -102,6 +139,88 @@ final class QuickTogglesService: ObservableObject {
         runAppleScript(.emptyTrash,
                        target: .finder,
                        source: QuickTogglesSupport.emptyTrashSource)
+    }
+
+    // MARK: - Quit apps (issue #855)
+
+    /// Opens the Quit apps window. `scope` only decides which batch button
+    /// Return presses; the list and both buttons are always there.
+    func showQuitApps(scope: QuitAppsScope = .all) {
+        guard quitAppsAvailable else { return }
+        QuitAppsPanelController.shared.show(scope: scope, frontmostPID: frontmostAppPID())
+    }
+
+    /// Soft quit only: `terminate()`, never `forceTerminate()`, so unsaved
+    /// document sheets still appear. Finder, Phone, Vorssaint, any app the user
+    /// listed as an exception and `keepingPID` are left alone.
+    func quitAllApps(keepingPID: pid_t?) {
+        guard quitAppsAvailable, beginRun(.quitAllApps) else { return }
+        let exceptions = Set(quitAllExceptions)
+        // `terminate()` only posts the quit request, and running-app state
+        // updates on the main run loop, so the sweep stays on main.
+        let running = NSWorkspace.shared.runningApplications
+        let targets = Set(QuickTogglesSupport.batchQuitTargets(
+            running.map(Self.candidate), exceptions: exceptions, keepingPID: keepingPID))
+        for app in running where targets.contains(app.processIdentifier) {
+            _ = app.terminate()
+        }
+        finishRun(.quitAllApps, state: nil)
+    }
+
+    /// Asks one app to quit, exceptions included: picking its row is explicit.
+    func quitApp(pid: pid_t) -> Bool {
+        guard quitAppsAvailable,
+              let app = NSRunningApplication(processIdentifier: pid),
+              let bundleID = app.bundleIdentifier,
+              !QuickTogglesSupport.vorssaintBundleIdentifiers.contains(bundleID) else { return false }
+        return app.terminate()
+    }
+
+    private static func candidate(_ app: NSRunningApplication) -> QuitAppsCandidate {
+        QuitAppsCandidate(pid: app.processIdentifier,
+                          bundleIdentifier: app.bundleIdentifier,
+                          activationPolicyRawValue: app.activationPolicy.rawValue,
+                          isTerminated: app.isTerminated)
+    }
+
+    /// Preserve the app in front, or the source remembered before our panel
+    /// took focus. An unrelated visible window is not a safe substitute.
+    func frontmostAppPID() -> pid_t? {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ownPID {
+            return front.processIdentifier
+        }
+        return (NSApp.delegate as? AppDelegate)?.panelActivationSourcePID
+    }
+
+    func addQuitAllException(_ bundleID: String) {
+        let bundleID = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bundleID.isEmpty, !quitAllExceptions.contains(bundleID) else { return }
+        var list = QuickTogglesSupport.sanitizedQuitAllExceptions(quitAllExceptions)
+        list.append(bundleID)
+        UserDefaults.standard.set(list, forKey: DefaultsKey.quitAppsKeptApps)
+        reloadQuitAllExceptions()
+    }
+
+    func removeQuitAllException(_ bundleID: String) {
+        guard !isMandatoryQuitAllException(bundleID) else { return }
+        let list = QuickTogglesSupport.sanitizedQuitAllExceptions(
+            quitAllExceptions.filter { $0 != bundleID })
+        UserDefaults.standard.set(list, forKey: DefaultsKey.quitAppsKeptApps)
+        reloadQuitAllExceptions()
+    }
+
+    func isMandatoryQuitAllException(_ bundleID: String) -> Bool {
+        Defaults.mandatoryAutoQuitExceptionBundleIDs.contains(bundleID)
+    }
+
+    private func reloadQuitAllExceptions() {
+        let raw = UserDefaults.standard.stringArray(forKey: DefaultsKey.quitAppsKeptApps) ?? []
+        let sanitized = QuickTogglesSupport.sanitizedQuitAllExceptions(raw)
+        if raw != sanitized {
+            UserDefaults.standard.set(sanitized, forKey: DefaultsKey.quitAppsKeptApps)
+        }
+        quitAllExceptions = sanitized
     }
 
     // MARK: - Finder flags
@@ -204,6 +323,10 @@ final class QuickTogglesService: ObservableObject {
 
     private var available: Bool {
         AppFeature.quickToggles.isAvailable
+    }
+
+    private var quitAppsAvailable: Bool {
+        AppFeature.quitApps.isAvailable
     }
 
     private static func automationTarget(for action: QuickToggleAction) -> Permissions.AutomationTarget? {
@@ -322,10 +445,15 @@ final class QuickTogglesService: ObservableObject {
             .volumeIsInternalKey, .volumeIsRemovableKey,
             .volumeIsEjectableKey, .volumeIsLocalKey,
             .volumeIsRootFileSystemKey,
+            .volumeNameKey,
+            .volumeLocalizedNameKey,
+            .volumeUUIDStringKey,
         ]
         guard let urls = FileManager.default.mountedVolumeURLs(
             includingResourceValuesForKeys: Array(keys),
             options: [.skipHiddenVolumes]) else { return [] }
+        let excludedList = UserDefaults.standard.stringArray(forKey: DefaultsKey.diskEjectExcludedVolumes) ?? []
+        let excludedSet = Set(excludedList.map { $0.lowercased() })
         return urls.filter { url in
             guard let values = try? url.resourceValues(forKeys: keys) else { return false }
             // A volume with no bus of its own, a mounted image for one, states
@@ -333,12 +461,17 @@ final class QuickTogglesService: ObservableObject {
             // internal. The local flag stays strict: a volume that will not say
             // it is local is left alone. The volume the Mac started from falls
             // back to its mount point, so a missing flag cannot expose it.
+            let name = values.volumeLocalizedName ?? values.volumeName ?? url.lastPathComponent
             return QuickTogglesSupport.shouldOfferEject(isInternal: values.volumeIsInternal ?? false,
                                                         isRemovable: values.volumeIsRemovable ?? false,
                                                         isEjectable: values.volumeIsEjectable ?? false,
                                                         isLocal: values.volumeIsLocal ?? false,
                                                         isRootFileSystem: values.volumeIsRootFileSystem
-                                                            ?? (url.path == "/"))
+                                                            ?? (url.path == "/"),
+                                                        volumeName: name,
+                                                        volumeUUID: values.volumeUUIDString,
+                                                        mountPath: url.path,
+                                                        excludedVolumes: excludedSet)
         }
     }
 

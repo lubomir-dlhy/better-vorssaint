@@ -12,10 +12,17 @@ struct BackupFeatureStrings {
     let exportButton: String
     let importButton: String
     let exported: String
+    let exportFailed: String
     let importConfirmTitle: String
     let importConfirmBody: String
+    let importConfigFileNotice: String
+    let importMissingIslandBody: String
     let importAction: String
     let invalidFile: String
+    let configFileButton: String
+    let configFileConfirmTitle: String
+    let configFileConfirmFormat: String
+    let configFileAction: String
 }
 
 extension FeatureStrings {
@@ -26,6 +33,7 @@ extension FeatureStrings {
         case .tr: return .tr
         case .ru: return .ru
         case .es: return .es
+        case .sk: return .sk
         case .de: return .de
         case .fr: return .fr
         case .it: return .it
@@ -34,6 +42,7 @@ extension FeatureStrings {
         case .zhHans: return .zhHans
         case .zhTW: return .zhTW
         case .zhHK: return .zhHK
+        case .uk: return .uk
         }
     }
 }
@@ -41,159 +50,287 @@ extension FeatureStrings {
 extension BackupFeatureStrings {
     static let ko = BackupFeatureStrings(
         title: "백업",
-        description: "설정을 다른 Mac으로 옮기세요. 모든 환경설정을 파일로 내보낸 뒤 그곳에서 가져올 수 있습니다. 빠른 메모의 텍스트도 파일에 포함됩니다. 클립보드 기록, 선반 항목 및 시스템 권한은 이 Mac 밖으로 나가지 않습니다.",
+        description: "설정을 다른 Mac으로 옮기세요. 모든 환경설정을 파일로 내보낸 뒤 그곳에서 가져올 수 있습니다. 빠른 메모의 텍스트, 클립보드 기록, 선반 항목 및 시스템 권한은 이 Mac 밖으로 나가지 않습니다.",
         exportButton: "설정 내보내기…",
         importButton: "설정 가져오기…",
         exported: "백업을 저장했습니다",
+        exportFailed: "백업을 저장하지 못했습니다.",
         importConfirmTitle: "이 설정을 가져올까요?",
         importConfirmBody: "현재 설정이 파일의 설정으로 바뀌고 앱이 다시 시작됩니다. 이 Mac의 다른 항목은 변경되지 않습니다.",
+        importConfigFileNotice: "다시 실행하면 XDG 파일의 설정이 가져온 값보다 우선합니다.",
+        importMissingIslandBody: "이 백업에는 Dynamic Island 설정이 없습니다. 이 Mac의 해당 설정은 유지됩니다. 다른 Mac의 설정을 복사하려면 Vorssaint 3.4 이상에서 다시 내보내세요. 나머지 설정을 가져온 뒤 앱이 다시 시작됩니다.",
         importAction: "가져오고 다시 시작",
-        invalidFile: "이 파일은 유효한 Vorssaint 백업이 아닙니다."
+        invalidFile: "이 파일은 유효한 Vorssaint 백업이 아닙니다.",
+        configFileButton: "설정 파일에 저장…",
+        configFileConfirmTitle: "설정 파일에 저장할까요?",
+        configFileConfirmFormat: "현재 설정 전체가 %@에 기록되며, 파일이 이미 있으면 대체됩니다. Vorssaint는 실행할 때마다 이 파일을 적용하므로 여기에서 설정을 변경한 후에는 다시 저장하세요.",
+        configFileAction: "저장"
+    )
+    static let uk = BackupFeatureStrings(
+        title: "Резервна копія",
+        description: "Перенесіть свої налаштування на інший Mac: експортуйте всі параметри у файл та імпортуйте їх там. Нотатки Нотатника, історія буфера обміну, елементи Полиці та системні дозволи ніколи не залишають цей Mac.",
+        exportButton: "Експортувати налаштування…",
+        importButton: "Імпортувати налаштування…",
+        exported: "Резервну копію збережено",
+        exportFailed: "Не вдалося зберегти резервну копію.",
+        importConfirmTitle: "Імпортувати ці налаштування?",
+        importConfirmBody: "Ваші поточні налаштування замінюються файлом, і програма перезапускається. Нічого іншого на цьому Mac не зачіпається.",
+        importConfigFileNotice: "Після перезапуску налаштування з файлу XDG матимуть перевагу над імпортованими значеннями.",
+        importMissingIslandBody: "У цій резервній копії немає налаштувань Dynamic Island. Налаштування на цьому Mac залишаться без змін. Щоб перенести їх з іншого Mac, експортуйте копію з Vorssaint 3.4 або новішої версії. Решту налаштувань буде імпортовано, а програму перезапущено.",
+        importAction: "Імпортувати та перезапустити",
+        invalidFile: "Цей файл не є коректною резервною копією Vorssaint.",
+        configFileButton: "Зберегти у файл налаштувань…",
+        configFileConfirmTitle: "Зберегти у файл налаштувань?",
+        configFileConfirmFormat: "Усі поточні налаштування буде записано в %@; якщо файл уже є, його буде замінено. Vorssaint застосовує його під час кожного запуску, тож після зміни налаштувань тут збережіть знову.",
+        configFileAction: "Зберегти"
     )
 }
 
 extension BackupFeatureStrings {
     static let enUS = BackupFeatureStrings(
         title: "Backup",
-        description: "Take your setup to another Mac: export every preference to a file and import it there. The file includes the text from your Scratchpad notes. Clipboard history, Shelf items and system permissions never leave this Mac.",
+        description: "Take your setup to another Mac: export every preference to a file and import it there. Your Scratchpad notes, clipboard history, Shelf items and system permissions never leave this Mac.",
         exportButton: "Export settings…",
         importButton: "Import settings…",
         exported: "Backup saved",
+        exportFailed: "Could not save the backup.",
         importConfirmTitle: "Import these settings?",
-        importConfirmBody: "Your current settings are replaced by the file's and the app restarts. Nothing else on this Mac is touched.",
+        importConfirmBody: "Your current settings are replaced by the file’s and the app restarts. Nothing else on this Mac is touched.",
+        importConfigFileNotice: "On relaunch, settings in your XDG file take precedence over the imported values.",
+        importMissingIslandBody: "This backup has no Dynamic Island settings. This Mac’s island settings will be kept. Re-export with Vorssaint 3.4 or newer on the other Mac to copy them. Other settings will be imported and the app will restart.",
         importAction: "Import and restart",
-        invalidFile: "This file is not a valid Vorssaint backup."
+        invalidFile: "This file is not a valid Vorssaint backup.",
+        configFileButton: "Save to settings file…",
+        configFileConfirmTitle: "Save to the settings file?",
+        configFileConfirmFormat: "Your current settings are written to %@ as a complete snapshot, replacing that file if it exists. Vorssaint applies it at each launch, so save again after changing settings here.",
+        configFileAction: "Save"
     )
 
     static let ptBR = BackupFeatureStrings(
         title: "Backup",
-        description: "Leve sua configuração para outro Mac: exporte todas as preferências para um arquivo e importe lá. O texto das suas notas no Rascunho entra no arquivo. Histórico da área de transferência, itens da área temporária e permissões do sistema nunca saem deste Mac.",
+        description: "Leve sua configuração para outro Mac: exporte todas as preferências para um arquivo e importe lá. O texto das suas notas no Rascunho, o histórico da área de transferência, os itens da área temporária e as permissões do sistema nunca saem deste Mac.",
         exportButton: "Exportar configurações…",
         importButton: "Importar configurações…",
         exported: "Backup salvo",
+        exportFailed: "Não foi possível salvar o backup.",
         importConfirmTitle: "Importar estas configurações?",
         importConfirmBody: "As configurações atuais são substituídas pelas do arquivo e o app reinicia. Nada mais neste Mac é alterado.",
+        importConfigFileNotice: "Ao reiniciar, as configurações do arquivo XDG têm prioridade sobre os valores importados.",
+        importMissingIslandBody: "Este backup não contém configurações da Dynamic Island. As configurações dela neste Mac serão mantidas. Para copiá-las do outro Mac, exporte novamente com o Vorssaint 3.4 ou mais recente. As demais configurações serão importadas e o app reiniciará.",
         importAction: "Importar e reiniciar",
-        invalidFile: "Este arquivo não é um backup válido do Vorssaint."
+        invalidFile: "Este arquivo não é um backup válido do Vorssaint.",
+        configFileButton: "Salvar no arquivo de configurações…",
+        configFileConfirmTitle: "Salvar no arquivo de configurações?",
+        configFileConfirmFormat: "Suas configurações atuais são gravadas por completo em %@, substituindo esse arquivo se ele existir. O Vorssaint aplica esse arquivo sempre que é aberto, então salve de novo depois de alterar as configurações aqui.",
+        configFileAction: "Salvar"
     )
 
     static let tr = BackupFeatureStrings(
         title: "Yedek",
-        description: "Kurulumunuzu başka bir Mac'e taşıyın: tüm tercihleri bir dosyaya aktarın ve orada içe aktarın. Karalama defteri notlarınızın metni dosyaya dahil edilir. Pano geçmişi, raf öğeleri ve sistem izinleri bu Mac'ten asla çıkmaz.",
+        description: "Kurulumunuzu başka bir Mac’e taşıyın: tüm tercihleri bir dosyaya aktarın ve orada içe aktarın. Karalama defteri notlarınızın metni, pano geçmişi, raf öğeleri ve sistem izinleri bu Mac’ten asla çıkmaz.",
         exportButton: "Ayarları dışa aktar…",
         importButton: "Ayarları içe aktar…",
         exported: "Yedek kaydedildi",
+        exportFailed: "Yedek kaydedilemedi.",
         importConfirmTitle: "Bu ayarlar içe aktarılsın mı?",
-        importConfirmBody: "Mevcut ayarlar dosyadakilerle değiştirilir ve uygulama yeniden başlar. Bu Mac'te başka hiçbir şeye dokunulmaz.",
+        importConfirmBody: "Mevcut ayarlar dosyadakilerle değiştirilir ve uygulama yeniden başlar. Bu Mac’te başka hiçbir şeye dokunulmaz.",
+        importConfigFileNotice: "Yeniden başlatıldığında XDG dosyasındaki ayarlar, içe aktarılan değerlere göre önceliklidir.",
+        importMissingIslandBody: "Bu yedekte Dynamic Island ayarları yok. Bu Mac’teki ada ayarları korunacak. Diğer Mac’ten kopyalamak için Vorssaint 3.4 veya daha yeni bir sürümle yeniden dışa aktarın. Diğer ayarlar içe aktarılacak ve uygulama yeniden başlayacak.",
         importAction: "İçe aktar ve yeniden başlat",
-        invalidFile: "Bu dosya geçerli bir Vorssaint yedeği değil."
+        invalidFile: "Bu dosya geçerli bir Vorssaint yedeği değil.",
+        configFileButton: "Ayar dosyasına kaydet…",
+        configFileConfirmTitle: "Ayar dosyasına kaydedilsin mi?",
+        configFileConfirmFormat: "Geçerli ayarlarınızın tamamı %@ dosyasına yazılır; dosya varsa değiştirilir. Vorssaint bu dosyayı her açılışta uygular; burada ayar değiştirdikten sonra yeniden kaydedin.",
+        configFileAction: "Kaydet"
     )
 
     static let ru = BackupFeatureStrings(
         title: "Резервная копия",
-        description: "Перенесите настройки на другой Mac: экспортируйте все параметры в файл и импортируйте его там. Текст заметок в Черновике включается в файл. История буфера обмена, объекты полки и системные разрешения никогда не покидают этот Mac.",
+        description: "Перенесите настройки на другой Mac: экспортируйте все параметры в файл и импортируйте его там. Текст заметок в Черновике, история буфера обмена, объекты полки и системные разрешения никогда не покидают этот Mac.",
         exportButton: "Экспортировать настройки…",
         importButton: "Импортировать настройки…",
         exported: "Копия сохранена",
+        exportFailed: "Не удалось сохранить копию.",
         importConfirmTitle: "Импортировать эти настройки?",
         importConfirmBody: "Текущие настройки заменяются настройками из файла, и приложение перезапускается. Больше ничего на этом Mac не меняется.",
+        importConfigFileNotice: "После перезапуска настройки из файла XDG имеют приоритет над импортированными значениями.",
+        importMissingIslandBody: "В этой копии нет настроек Dynamic Island. Настройки на этом Mac сохранятся. Чтобы перенести их с другого Mac, экспортируйте копию из Vorssaint 3.4 или новее. Остальные настройки будут импортированы, затем приложение перезапустится.",
         importAction: "Импортировать и перезапустить",
-        invalidFile: "Этот файл не является корректной резервной копией Vorssaint."
+        invalidFile: "Этот файл не является корректной резервной копией Vorssaint.",
+        configFileButton: "Сохранить в файл настроек…",
+        configFileConfirmTitle: "Сохранить в файл настроек?",
+        configFileConfirmFormat: "Все текущие настройки будут записаны в %@; если файл уже есть, он будет заменён. Vorssaint применяет его при каждом запуске, поэтому после изменения настроек здесь сохраните снова.",
+        configFileAction: "Сохранить"
     )
 
     static let es = BackupFeatureStrings(
         title: "Copia de seguridad",
-        description: "Lleva tu configuración a otro Mac: exporta todas las preferencias a un archivo e impórtalo allí. El archivo incluye el texto de las notas de Borrador. El historial del portapapeles, los elementos del estante y los permisos del sistema nunca salen de este Mac.",
+        description: "Lleva tu configuración a otro Mac: exporta todas las preferencias a un archivo e impórtalo allí. El texto de las notas de Borrador, el historial del portapapeles, los elementos del estante y los permisos del sistema nunca salen de este Mac.",
         exportButton: "Exportar ajustes…",
         importButton: "Importar ajustes…",
         exported: "Copia guardada",
+        exportFailed: "No se pudo guardar la copia.",
         importConfirmTitle: "¿Importar estos ajustes?",
         importConfirmBody: "Los ajustes actuales se sustituyen por los del archivo y la app se reinicia. Nada más cambia en este Mac.",
+        importConfigFileNotice: "Al reiniciar, los ajustes del archivo XDG tienen prioridad sobre los valores importados.",
+        importMissingIslandBody: "Esta copia no contiene ajustes de Dynamic Island. Se conservarán los ajustes de esta Mac. Para copiarlos desde la otra Mac, exporta de nuevo con Vorssaint 3.4 o posterior. Se importarán los demás ajustes y la app se reiniciará.",
         importAction: "Importar y reiniciar",
-        invalidFile: "Este archivo no es una copia de seguridad válida de Vorssaint."
+        invalidFile: "Este archivo no es una copia de seguridad válida de Vorssaint.",
+        configFileButton: "Guardar en el archivo de ajustes…",
+        configFileConfirmTitle: "¿Guardar en el archivo de ajustes?",
+        configFileConfirmFormat: "Todos tus ajustes actuales se escriben en %@ y reemplazan ese archivo si ya existe. Vorssaint lo aplica cada vez que se abre, así que vuelve a guardar después de cambiar los ajustes aquí.",
+        configFileAction: "Guardar"
+    )
+
+    static let sk = BackupFeatureStrings(
+        title: "Záloha",
+        description: "Preneste svoje nastavenia na iný Mac: exportujte všetky predvoľby do súboru a tam ich importujte. Poznámkový blok, história schránky, položky police a systémové povolenia nikdy neopustia tento Mac.",
+        exportButton: "Exportovať nastavenia…",
+        importButton: "Importovať nastavenia…",
+        exported: "Záloha uložená",
+        exportFailed: "Zálohu sa nepodarilo uložiť.",
+        importConfirmTitle: "Importovať tieto nastavenia?",
+        importConfirmBody: "Vaše aktuálne nastavenia sa nahradia nastaveniami zo súboru a aplikácia sa reštartuje. Nič iné na tomto Macu sa nezmení.",
+        importConfigFileNotice: "Po opätovnom spustení majú nastavenia zo súboru XDG prednosť pred importovanými hodnotami.",
+        importMissingIslandBody: "Táto záloha neobsahuje nastavenia Dynamic Island. Nastavenia na tomto Macu zostanú zachované. Ak ich chcete preniesť z druhého Macu, exportujte zálohu znova vo Vorssaint 3.4 alebo novšom. Ostatné nastavenia sa importujú a aplikácia sa reštartuje.",
+        importAction: "Importovať a reštartovať",
+        invalidFile: "Tento súbor nie je platná záloha Vorssaint.",
+        configFileButton: "Uložiť do súboru nastavení…",
+        configFileConfirmTitle: "Uložiť do súboru nastavení?",
+        configFileConfirmFormat: "Všetky aktuálne nastavenia sa zapíšu do %@ a nahradia tento súbor, ak už existuje. Vorssaint ho použije pri každom spustení, preto po zmene nastavení tu uložte znova.",
+        configFileAction: "Uložiť"
     )
 
     static let de = BackupFeatureStrings(
         title: "Backup",
-        description: "Nimm deine Einrichtung mit auf einen anderen Mac: exportiere alle Einstellungen in eine Datei und importiere sie dort. Die Datei enthält den Text deiner Notizen im Schmierzettel. Zwischenablage-Verlauf, Ablage-Objekte und Systemberechtigungen verlassen diesen Mac nie.",
+        description: "Nimm deine Einrichtung mit auf einen anderen Mac: exportiere alle Einstellungen in eine Datei und importiere sie dort. Der Text deiner Notizen im Schmierzettel, Zwischenablage-Verlauf, Ablage-Objekte und Systemberechtigungen verlassen diesen Mac nie.",
         exportButton: "Einstellungen exportieren…",
         importButton: "Einstellungen importieren…",
         exported: "Backup gesichert",
+        exportFailed: "Backup konnte nicht gesichert werden.",
         importConfirmTitle: "Diese Einstellungen importieren?",
         importConfirmBody: "Die aktuellen Einstellungen werden durch die der Datei ersetzt und die App startet neu. Sonst ändert sich auf diesem Mac nichts.",
+        importConfigFileNotice: "Beim Neustart haben die Einstellungen aus der XDG-Datei Vorrang vor den importierten Werten.",
+        importMissingIslandBody: "Dieses Backup enthält keine Dynamic-Island-Einstellungen. Die Einstellungen auf diesem Mac bleiben erhalten. Um sie vom anderen Mac zu übernehmen, exportiere erneut mit Vorssaint 3.4 oder neuer. Die übrigen Einstellungen werden importiert und die App startet neu.",
         importAction: "Importieren und neu starten",
-        invalidFile: "Diese Datei ist kein gültiges Vorssaint-Backup."
+        invalidFile: "Diese Datei ist kein gültiges Vorssaint-Backup.",
+        configFileButton: "In Einstellungsdatei sichern…",
+        configFileConfirmTitle: "In der Einstellungsdatei sichern?",
+        configFileConfirmFormat: "Alle aktuellen Einstellungen werden in %@ geschrieben und ersetzen diese Datei, falls sie existiert. Vorssaint wendet sie bei jedem Start an, sichere daher erneut, nachdem du hier Einstellungen änderst.",
+        configFileAction: "Sichern"
     )
 
     static let fr = BackupFeatureStrings(
         title: "Sauvegarde",
-        description: "Emportez votre configuration sur un autre Mac : exportez toutes les préférences dans un fichier et importez-le là-bas. Le fichier inclut le texte de vos notes dans Brouillon. L'historique du presse-papiers, les éléments de l'étagère et les autorisations système ne quittent jamais ce Mac.",
+        description: "Emportez votre configuration sur un autre Mac\u{00A0}: exportez toutes les préférences dans un fichier et importez-le là-bas. Le texte de vos notes dans Brouillon, l’historique du presse-papiers, les éléments de l’étagère et les autorisations système ne quittent jamais ce Mac.",
         exportButton: "Exporter les réglages…",
         importButton: "Importer les réglages…",
         exported: "Sauvegarde enregistrée",
-        importConfirmTitle: "Importer ces réglages ?",
-        importConfirmBody: "Les réglages actuels sont remplacés par ceux du fichier et l'app redémarre. Rien d'autre ne change sur ce Mac.",
+        exportFailed: "Impossible d’enregistrer la sauvegarde.",
+        importConfirmTitle: "Importer ces réglages\u{00A0}?",
+        importConfirmBody: "Les réglages actuels sont remplacés par ceux du fichier et l’app redémarre. Rien d’autre ne change sur ce Mac.",
+        importConfigFileNotice: "Au prochain lancement, les réglages du fichier XDG auront priorité sur les valeurs importées.",
+        importMissingIslandBody: "Cette sauvegarde ne contient aucun réglage de Dynamic Island. Les réglages de ce Mac seront conservés. Pour les copier depuis l’autre Mac, exportez à nouveau avec Vorssaint 3.4 ou une version ultérieure. Les autres réglages seront importés, puis l’app redémarrera.",
         importAction: "Importer et redémarrer",
-        invalidFile: "Ce fichier n'est pas une sauvegarde Vorssaint valide."
+        invalidFile: "Ce fichier n’est pas une sauvegarde Vorssaint valide.",
+        configFileButton: "Enregistrer dans le fichier de réglages…",
+        configFileConfirmTitle: "Enregistrer dans le fichier de réglages\u{00A0}?",
+        configFileConfirmFormat: "Tous vos réglages actuels sont écrits dans %@ et remplacent ce fichier s’il existe. Vorssaint l’applique à chaque ouverture\u{00A0}: enregistrez de nouveau après avoir modifié les réglages ici.",
+        configFileAction: "Enregistrer"
     )
 
     static let it = BackupFeatureStrings(
         title: "Backup",
-        description: "Porta la tua configurazione su un altro Mac: esporta tutte le preferenze in un file e importalo lì. Il file include il testo delle note in Bozza. Cronologia degli appunti, elementi della mensola e permessi di sistema non lasciano mai questo Mac.",
+        description: "Porta la tua configurazione su un altro Mac: esporta tutte le preferenze in un file e importalo lì. Il testo delle note in Bozza, la cronologia degli appunti, gli elementi della mensola e i permessi di sistema non lasciano mai questo Mac.",
         exportButton: "Esporta impostazioni…",
         importButton: "Importa impostazioni…",
         exported: "Backup salvato",
+        exportFailed: "Impossibile salvare il backup.",
         importConfirmTitle: "Importare queste impostazioni?",
-        importConfirmBody: "Le impostazioni attuali vengono sostituite da quelle del file e l'app si riavvia. Nient'altro cambia su questo Mac.",
+        importConfirmBody: "Le impostazioni attuali vengono sostituite da quelle del file e l’app si riavvia. Nient’altro cambia su questo Mac.",
+        importConfigFileNotice: "Al riavvio, le impostazioni del file XDG hanno la precedenza sui valori importati.",
+        importMissingIslandBody: "Questo backup non contiene le impostazioni di Dynamic Island. Quelle su questo Mac verranno mantenute. Per copiarle dall’altro Mac, esporta di nuovo con Vorssaint 3.4 o successivo. Le altre impostazioni verranno importate e l’app si riavvierà.",
         importAction: "Importa e riavvia",
-        invalidFile: "Questo file non è un backup Vorssaint valido."
+        invalidFile: "Questo file non è un backup Vorssaint valido.",
+        configFileButton: "Salva nel file delle impostazioni…",
+        configFileConfirmTitle: "Salvare nel file delle impostazioni?",
+        configFileConfirmFormat: "Tutte le impostazioni attuali vengono scritte in %@, sostituendo il file se esiste già. Vorssaint lo applica a ogni avvio, quindi salva di nuovo dopo aver modificato le impostazioni qui.",
+        configFileAction: "Salva"
     )
 
     static let ja = BackupFeatureStrings(
         title: "バックアップ",
-        description: "設定を別のMacへ。すべての環境設定をファイルに書き出し、そちらで読み込みます。ファイルにはクイックメモの本文も含まれます。クリップボード履歴、シェルフの項目、システム権限がこのMacの外に出ることはありません。",
+        description: "設定を別のMacへ。すべての環境設定をファイルに書き出し、そちらで読み込みます。クイックメモの本文、クリップボード履歴、シェルフの項目、システム権限がこのMacの外に出ることはありません。",
         exportButton: "設定を書き出す…",
         importButton: "設定を読み込む…",
         exported: "バックアップを保存しました",
+        exportFailed: "バックアップを保存できませんでした。",
         importConfirmTitle: "この設定を読み込みますか?",
         importConfirmBody: "現在の設定はファイルの内容に置き換えられ、アプリが再起動します。このMacのほかの部分は変わりません。",
+        importConfigFileNotice: "再起動時には、読み込んだ値よりも XDG ファイルの設定が優先されます。",
+        importMissingIslandBody: "このバックアップにはDynamic Islandの設定がありません。このMacの設定は維持されます。別のMacからコピーするには、Vorssaint 3.4以降で再度書き出してください。その他の設定を読み込んだ後、アプリが再起動します。",
         importAction: "読み込んで再起動",
-        invalidFile: "このファイルは有効なVorssaintのバックアップではありません。"
+        invalidFile: "このファイルは有効なVorssaintのバックアップではありません。",
+        configFileButton: "設定ファイルに保存…",
+        configFileConfirmTitle: "設定ファイルに保存しますか?",
+        configFileConfirmFormat: "現在のすべての設定が%@に書き込まれます。ファイルがすでにある場合は置き換えられます。Vorssaintは起動するたびにこのファイルを適用するため、ここで設定を変更したら再度保存してください。",
+        configFileAction: "保存"
     )
 
     static let zhHans = BackupFeatureStrings(
         title: "备份",
-        description: "把你的配置带到另一台 Mac：将所有偏好设置导出为文件并在那里导入。文件中也包含草稿板里的笔记文本。剪贴板历史、暂存架项目和系统权限永远不会离开这台 Mac。",
+        description: "把你的配置带到另一台 Mac：将所有偏好设置导出为文件并在那里导入。草稿板里的笔记文本、剪贴板历史、暂存架项目和系统权限永远不会离开这台 Mac。",
         exportButton: "导出设置…",
         importButton: "导入设置…",
-        exported: "备份已保存",
+        exported: "备份已存储",
+        exportFailed: "无法存储备份。",
         importConfirmTitle: "导入这些设置？",
-        importConfirmBody: "当前设置将被文件中的设置替换，应用会重启。这台 Mac 上的其他内容不受影响。",
+        importConfirmBody: "当前设置将被文件中的设置替换，App 会重启。这台 Mac 上的其他内容不受影响。",
+        importConfigFileNotice: "重新启动后，XDG 文件中的设置优先于导入的值。",
+        importMissingIslandBody: "此备份不包含 Dynamic Island 设置。这台 Mac 上的相关设置将保留。要从另一台 Mac 复制这些设置，请使用 Vorssaint 3.4 或更新版本重新导出。其他设置将被导入，然后 App 会重启。",
         importAction: "导入并重启",
-        invalidFile: "该文件不是有效的 Vorssaint 备份。"
+        invalidFile: "该文件不是有效的 Vorssaint 备份。",
+        configFileButton: "存储到设置文件…",
+        configFileConfirmTitle: "要存储到设置文件吗？",
+        configFileConfirmFormat: "当前的全部设置将写入 %@，如果该文件已存在则会被替换。Vorssaint 每次启动时都会应用该文件，因此在这里更改设置后请重新存储。",
+        configFileAction: "存储"
     )
 
     static let zhTW = BackupFeatureStrings(
         title: "備份",
-        description: "把你的設定帶到另一台 Mac:將所有偏好設定匯出為檔案並在那裡匯入。檔案也包含草稿板中的筆記文字。剪貼板歷史、暫存架項目和系統權限永遠不會離開這台 Mac。",
+        description: "把你的設定帶到另一台 Mac:將所有偏好設定匯出為檔案並在那裡匯入。草稿板中的筆記文字、剪貼板歷史、暫存架項目和系統權限永遠不會離開這台 Mac。",
         exportButton: "匯出設定…",
         importButton: "匯入設定…",
         exported: "備份已儲存",
+        exportFailed: "無法儲存備份。",
         importConfirmTitle: "匯入這些設定?",
         importConfirmBody: "目前設定將被檔案中的設定取代,App 會重新啟動。這台 Mac 上的其他內容不受影響。",
+        importConfigFileNotice: "重新啟動後，XDG 檔案中的設定會優先於匯入的值。",
+        importMissingIslandBody: "此備份不包含 Dynamic Island 設定。這台 Mac 上的相關設定會保留。若要從另一台 Mac 複製這些設定,請使用 Vorssaint 3.4 或較新版本重新匯出。其他設定會匯入,然後 App 會重新啟動。",
         importAction: "匯入並重新啟動",
-        invalidFile: "此檔案不是有效的 Vorssaint 備份。"
+        invalidFile: "此檔案不是有效的 Vorssaint 備份。",
+        configFileButton: "儲存到設定檔…",
+        configFileConfirmTitle: "要儲存到設定檔嗎?",
+        configFileConfirmFormat: "目前的所有設定會寫入 %@,若該檔案已存在則會被取代。Vorssaint 每次啟動時都會套用此檔案,因此在這裡更改設定後請再次儲存。",
+        configFileAction: "儲存"
     )
 
     static let zhHK = BackupFeatureStrings(
         title: "備份",
-        description: "把你的設定帶到另一台 Mac:將所有偏好設定匯出為檔案並在那裡匯入。檔案亦包含草稿板入面嘅筆記文字。剪貼板歷史、暫存架項目和系統權限永遠不會離開這台 Mac。",
+        description: "把你的設定帶到另一台 Mac:將所有偏好設定匯出為檔案並在那裡匯入。草稿板入面嘅筆記文字、剪貼板歷史、暫存架項目和系統權限永遠不會離開這台 Mac。",
         exportButton: "匯出設定…",
         importButton: "匯入設定…",
         exported: "備份已儲存",
+        exportFailed: "儲存唔到備份。",
         importConfirmTitle: "匯入這些設定?",
         importConfirmBody: "目前設定將被檔案中的設定取代,App 會重新啟動。這台 Mac 上的其他內容不受影響。",
+        importConfigFileNotice: "重新啟動後，XDG 檔案中的設定會優先於匯入的值。",
+        importMissingIslandBody: "呢份備份冇 Dynamic Island 設定。呢部 Mac 上嘅相關設定會保留。想從另一部 Mac 複製呢啲設定,請用 Vorssaint 3.4 或更新版本重新匯出。其他設定會匯入,之後 App 會重新啟動。",
         importAction: "匯入並重新啟動",
-        invalidFile: "此檔案不是有效嘅 Vorssaint 備份。"
+        invalidFile: "此檔案不是有效嘅 Vorssaint 備份。",
+        configFileButton: "儲存到設定檔…",
+        configFileConfirmTitle: "要儲存到設定檔嗎?",
+        configFileConfirmFormat: "而家所有設定會寫入 %@,如果檔案已經存在就會被取代。Vorssaint 每次啟動都會套用呢個檔案,所以喺呢度改完設定之後要再儲存一次。",
+        configFileAction: "儲存"
     )
 }

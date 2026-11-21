@@ -35,11 +35,79 @@ This one feeds window titles and thumbnails in the switcher and Dock Preview. If
 
 ### System Audio Recording
 
-This one powers per app volume and output routing in the mixer. If the mixer says it needs permission, open System Settings, Privacy and Security, Screen and System Audio Recording, and switch Vorssaint on. Audio is processed only for the local mixer.
+This permission is used by the mixer, the optional live equalizer and system audio capture for recordings. If a feature asks for it, open System Settings, Privacy and Security, Screen and System Audio Recording, and switch Vorssaint on. See the [permissions guide](PERMISSIONS.md#system-audio-recording) for what each feature does with the audio.
 
 ### Automation
 
-Finder cut and paste, the uninstaller and Homebrew's Terminal handoff may ask for Automation. If a Finder move or Terminal handoff does nothing after a denial, open System Settings, Privacy and Security, Automation, and allow Vorssaint for the app it needs to control.
+Finder cut and paste and the uninstaller may ask for Automation. If a Finder move does nothing after a denial, open System Settings, Privacy and Security, Automation, and allow Vorssaint for Finder.
+
+## Clipboard history does not copy or paste
+
+First check whether a fresh copy appears in history. History must be enabled,
+and copies from excluded apps or marked as concealed are not saved. Compare
+copy-only followed by Command-V with automatic paste. If only automatic paste
+fails, check Accessibility and the app that should receive the paste.
+
+A failed history copy sounds the system alert and does not trigger automatic
+paste. A request also fails after five seconds, or if another history copy is
+still pending. Expired requests that have not started are skipped. A write
+already in progress can still change the clipboard; it cannot be rolled back.
+
+If another app stops answering a clipboard read, history waits for that read
+to end instead of adding more reads behind it. The deadline does not unblock
+macOS. If copying fresh text does not restore history, quit and reopen the
+source app and Vorssaint. Include the source app and macOS version in a report;
+do not include private clipboard content.
+
+## Homebrew and your shell startup files
+
+Homebrew inside Vorssaint uses the proxy and `HOMEBREW_*` settings your shell
+exports, so it reaches the same servers as Terminal. To find them, Vorssaint
+starts your login shell once per launch, the way Terminal does, which reads
+`~/.zprofile` and `~/.zshrc`. Because Vorssaint starts it, a startup file that
+reads a protected folder asks for access in Vorssaint's name.
+
+During that run `VORSSAINT_RESOLVING_ENVIRONMENT` is set to `1`. A startup file
+can check it to skip work that only makes sense in a terminal window, such as
+starting a multiplexer or a slow prompt:
+
+```sh
+[[ -n $VORSSAINT_RESOLVING_ENVIRONMENT ]] && return
+```
+
+## Keeping settings in your dotfiles
+
+At each normal launch, Vorssaint reads `~/.config/vorssaint/settings.plist`.
+An absolute `XDG_CONFIG_HOME` selects the parent of `vorssaint/`. The Developer
+build uses `vorssaint-dev/`. Git, Stow or Home Manager can own the file,
+including a symlink to a read-only target. Edits made during a session take
+effect the next time you launch the app.
+
+Create a starting file with **Save to settings file…** under Settings >
+Advanced > Backup, which shows the path and asks before writing, or export
+from the command line. Backups include your text snippets, so review the
+contents before sharing one.
+
+```sh
+/Applications/Vorssaint.app/Contents/MacOS/Vorssaint --export-settings ~/.config/vorssaint/settings.plist
+```
+
+Keep the backup version and the `settings` dictionary. You can trim the
+dictionary to just the settings you want to manage. Omitted preferences and
+snippets stay local, and the app only reads this file during normal use.
+An explicit export or save replaces its destination with a complete snapshot,
+and the app never writes the file on its own. The file applies at every launch,
+so save again after changing settings in the app, or the next launch brings
+the saved values back. A read-only target, such as a
+Nix store link, is left unchanged and the save reports that it failed.
+Export to a separate path to review changes to a hand-maintained file.
+The Import button and `--import-settings FILE` restore the backup. On the next
+launch, values declared in the XDG file take precedence over the imported ones.
+Quit the app before importing from a script.
+
+Apps opened from Finder inherit the login environment. To choose a custom
+folder, set it with `launchctl setenv XDG_CONFIG_HOME "$HOME/my-config"` and
+reopen Vorssaint.
 
 ## Resetting permissions
 
@@ -58,6 +126,11 @@ To wipe Vorssaint's granted permissions and let macOS ask again from scratch, pi
   tccutil reset Accessibility com.vorssaint.utils
   tccutil reset ScreenCapture com.vorssaint.utils
   ```
+
+  A self-built Developer variant has its own grants under
+  `com.vorssaint.utils.dev`. Resetting is the way out when System Settings
+  shows the permission as granted but the app disagrees — that happens when a
+  grant was given to an earlier ad-hoc build whose signature no longer matches.
 
 ## Clean uninstall
 

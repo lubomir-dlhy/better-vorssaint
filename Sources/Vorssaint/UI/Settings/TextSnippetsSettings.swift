@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Vorssaint
 
+import AppKit
 import SwiftUI
 
 /// The text snippets page: the enable toggle, the snippet list and a simple
@@ -10,8 +11,11 @@ struct TextSnippetsSettings: View {
     @ObservedObject private var l10n = L10n.shared
     @ObservedObject private var permissions = Permissions.shared
     @ObservedObject private var library = SnippetLibraryService.shared
+    @ObservedObject private var secureInput = SecureInputMonitor.shared
     @AppStorage(DefaultsKey.textSnippetsEnabled) private var enabled = false
     @AppStorage(DefaultsKey.snippetLibraryEnabled) private var libraryEnabled = false
+    @AppStorage(DefaultsKey.snippetSoundEnabled) private var soundEnabled = false
+    @AppStorage(DefaultsKey.snippetSoundName) private var soundName = Defaults.defaultSnippetSoundName
     @State private var snippets: [TextSnippet] = TextSnippetSupport.decode(
         UserDefaults.standard.data(forKey: DefaultsKey.textSnippets))
     @State private var editing: TextSnippet?
@@ -33,6 +37,36 @@ struct TextSnippetsSettings: View {
                     .foregroundStyle(.secondary)
                 if enabled, !permissions.accessibility {
                     PermissionRow(kind: .accessibility)
+                }
+                if enabled {
+                    Toggle(text.soundToggle, isOn: $soundEnabled)
+                        .onChange(of: soundEnabled) { _, _ in
+                            TextSnippetService.shared.syncExpansionSound()
+                        }
+                    Text(text.soundCaption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if soundEnabled {
+                        Picker(text.soundPickerLabel, selection: $soundName) {
+                            ForEach(AlertSoundStrings.sortedNames(TextSnippetSupport.alertSoundNames,
+                                                                  language: l10n.language), id: \.self) { name in
+                                Text(AlertSoundStrings.displayName(for: name, language: l10n.language)).tag(name)
+                            }
+                            // A name stored on another Mac, or dropped by a
+                            // macOS update, needs a row of its own or the
+                            // picker shows an empty selection. Asked through
+                            // the same resolver the service arms the sound
+                            // with, so the row cannot call a name usable that
+                            // an expansion would substitute away from.
+                            if TextSnippetSupport.resolvedSoundName(stored: soundName) != soundName {
+                                Text(text.soundUnavailable).tag(soundName)
+                            }
+                        }
+                        .onChange(of: soundName) { _, _ in
+                            TextSnippetService.shared.syncExpansionSound()
+                            TextSnippetService.shared.previewExpansionSound()
+                        }
+                    }
                 }
             }
 
@@ -59,13 +93,21 @@ struct TextSnippetsSettings: View {
                 Text(text.libraryTitle)
             }
 
+            // The library beeps under secure input whether or not trigger
+            // expansion is on, so either toggle earns the explanation. It
+            // answers to both, so it sits under both rather than inside the
+            // section for one of them.
+            if enabled || libraryEnabled, secureInput.holder != .off {
+                Section { SecureInputRow() }
+            }
+
             Section {
                 if snippets.isEmpty {
                     Text(text.emptyList)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                ForEach(snippets) { snippet in
+                ForEach(TextSnippetSupport.sortedForDisplay(snippets)) { snippet in
                     SnippetRow(snippet: snippet,
                                modeLabel: snippet.expansion == .immediate
                                    ? text.expansionImmediate
@@ -89,6 +131,7 @@ struct TextSnippetsSettings: View {
             }
         }
         .formStyle(.grouped)
+        .observesSecureInput(isActive: enabled || libraryEnabled)
         .sheet(isPresented: $creating) {
             SnippetEditor(text: text,
                           snippet: TextSnippet(),
@@ -188,6 +231,12 @@ private struct SnippetRow: View {
     }
 }
 
+/// Holds the replacement field's text view so the date/time builder can
+/// edit through it. Weak, since the view belongs to the editor sheet.
+private final class EditorHandle {
+    weak var view: NSTextView?
+}
+
 private struct SnippetEditor: View {
     let text: SnippetFeatureStrings
     @State var snippet: TextSnippet
@@ -197,6 +246,13 @@ private struct SnippetEditor: View {
     let delete: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var l10n = L10n.shared
+    @State private var replacementSelection: Range<Int>?
+    @State private var showingDateBuilder = false
+    @State private var dateBuilderInitial: TextSnippetSupport.DetectedDateToken?
+    /// @State so the handle outlives a view rebuild, and a class so the
+    /// text view can be stored into it while it is being made without
+    /// publishing a change from inside a view update.
+    @State private var replacementEditor = EditorHandle()
 
     private var sanitizedTrigger: String {
         TextSnippetSupport.sanitizedTrigger(snippet.trigger)
@@ -217,6 +273,37 @@ private struct SnippetEditor: View {
 
     private var folderSuggestions: [String] {
         TextSnippetSupport.folderSuggestions(others)
+    }
+
+    private var selectedRange: Range<String.Index> {
+        TextSnippetSupport.selectionRange(in: snippet.replacement,
+                                          offsets: replacementSelection)
+    }
+
+    private var detectedTokenAtCursor: TextSnippetSupport.DetectedDateToken? {
+        TextSnippetSupport.dateToken(in: snippet.replacement, at: selectedRange.lowerBound)
+    }
+
+    /// Splices the built token into the replacement text, replacing an
+    /// existing token in edit mode or the current selection otherwise.
+    /// Edits through the text view rather than the binding so the insert
+    /// joins its undo stack and leaves the caret after the token; going
+    /// through the binding replaces the whole string, which drops the
+    /// caret at the end and discards everything the user could undo.
+    private func insertDateToken(_ tokenText: String) {
+        let text = snippet.replacement
+        let range = TextSnippetSupport.selectionRange(
+            in: text, offsets: dateBuilderInitial?.offsets ?? replacementSelection)
+        guard let textView = replacementEditor.view else {
+            snippet.replacement.replaceSubrange(range, with: tokenText)
+            return
+        }
+        let target = NSRange(range, in: text)
+        guard textView.shouldChangeText(in: target, replacementString: tokenText) else { return }
+        textView.replaceCharacters(in: target, with: tokenText)
+        textView.didChangeText()
+        textView.setSelectedRange(
+            NSRange(location: target.location + (tokenText as NSString).length, length: 0))
     }
 
     var body: some View {
@@ -248,9 +335,34 @@ private struct SnippetEditor: View {
                 }
                 Toggle(text.showInLibraryLabel, isOn: $snippet.showsInLibrary)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(text.replacementLabel)
-                    TextEditor(text: $snippet.replacement)
-                        .font(.body)
+                    HStack {
+                        Text(text.replacementLabel)
+                        Spacer()
+                        Button {
+                            dateBuilderInitial = detectedTokenAtCursor
+                            showingDateBuilder = true
+                        } label: {
+                            Label(detectedTokenAtCursor == nil ? text.dateTimeInsertButton : text.dateTimeEditButton,
+                                  systemImage: "calendar.badge.plus")
+                        }
+                        .popover(isPresented: $showingDateBuilder) {
+                            DateVariableBuilder(
+                                text: text,
+                                cancelLabel: l10n.s.uninstallerCancel,
+                                locale: .current,
+                                initial: dateBuilderInitial,
+                                confirm: { tokenText in
+                                    insertDateToken(tokenText)
+                                    showingDateBuilder = false
+                                },
+                                cancel: { showingDateBuilder = false }
+                            )
+                            .frame(width: 340)
+                        }
+                    }
+                    PlainTextEditor(text: $snippet.replacement,
+                                    selectedRange: $replacementSelection,
+                                    onCreate: { replacementEditor.view = $0 })
                         .frame(minHeight: 76)
                         .overlay(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -259,7 +371,7 @@ private struct SnippetEditor: View {
                     Text(text.variablesHint)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text(text.variablesFormatCaption)
+                    Text(text.editorFormatCaption)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

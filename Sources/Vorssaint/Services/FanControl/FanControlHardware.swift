@@ -272,11 +272,8 @@ final class FanControlHardware {
     func restoreAutomatic() -> Bool {
         guard let fans = try? discoverControlledFans() else { return false }
         for fan in fans {
+            // Preserve the last safe target if firmware rejects the mode change.
             _ = setMode(0, for: fan, attempts: 20)
-            // The target is ignored in automatic mode. Clear it when the
-            // controller accepts the write, but never mistake a rejected
-            // target reset for a failure to return control to the firmware.
-            _ = setValue(0, for: fan.target, attempts: 10)
         }
         if let forceTest = forceTestKey() {
             _ = setByte(0, for: forceTest, attempts: 20)
@@ -508,6 +505,7 @@ final class FanControlHardware {
     }
 
     private func setValue(_ value: Double, for key: SMCClient.Key, attempts: Int) -> Bool {
+        guard value.isFinite else { return false }
         for attempt in 0..<attempts {
             do { try client.writeValue(value, to: key) } catch {}
             // F*Tg is known to occasionally return controller error 0x87 after
@@ -523,4 +521,13 @@ final class FanControlHardware {
     private func targetMatches(_ applied: Double, expected: Double) -> Bool {
         applied.isFinite && abs(applied - expected) <= max(2, abs(expected) * 0.001)
     }
+
+    /// Whether this Mac exposes a fan the app can actually drive. It asks the
+    /// same discovery the control path uses, so "controllable" means the very
+    /// keys a cooling write needs, not merely a reported fan count. Hardware
+    /// does not change under a running process, so the answer is computed once.
+    static let hasControllableFan: Bool = {
+        guard let hardware = FanControlHardware() else { return false }
+        return (try? hardware.discoverControlledFans())?.isEmpty == false
+    }()
 }

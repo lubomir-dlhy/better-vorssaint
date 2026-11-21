@@ -26,12 +26,16 @@ struct DiskDeviceReading: Identifiable, Equatable {
     var id: String
     var name: String
     var mountPath: String
+    /// Stable across renames and remounts, so the eject exclusion list matches
+    /// on it as well as on the name and the mount path.
+    var volumeUUID: String?
     var bsdName: String?
     var wholeDisk: String?
     var ioCounterID: String?
     var fileSystem: String?
     var totalBytes: UInt64
     var freeBytes: UInt64
+    var purgeableBytes: UInt64?
     var usedBytes: UInt64
     var isInternal: Bool
     var isRemovable: Bool
@@ -56,6 +60,28 @@ struct DiskDeviceReading: Identifiable, Equatable {
     }
 }
 
+enum DiskMenuBarStyle: String, CaseIterable {
+    case percent, free, used
+
+    static let defaultsKey = DefaultsKey.menuBarDiskStyle
+
+    static var current: DiskMenuBarStyle {
+        DiskMenuBarStyle(rawValue: UserDefaults.standard.string(forKey: defaultsKey) ?? "") ?? .percent
+    }
+
+    var showsPercentage: Bool { self == .percent }
+
+    var minimumValue: String { showsPercentage ? "100%" : "1000 GB" }
+
+    func value(for disk: DiskDeviceReading) -> String {
+        switch self {
+        case .percent: return MetricFormat.percent(disk.usedFraction)
+        case .free: return MetricFormat.diskBytes(disk.freeBytes)
+        case .used: return MetricFormat.diskBytes(disk.usedBytes)
+        }
+    }
+}
+
 struct DiskReading: Equatable {
     var devices: [DiskDeviceReading] = []
 
@@ -72,6 +98,18 @@ struct DiskReading: Equatable {
 
 enum DiskSupport {
     static let nvmeDataUnitBytes: UInt64 = 512_000
+
+    /// Important-use capacity can add reclaimable space, but must never hide
+    /// bytes already free on the volume. Keep a real zero distinct from a
+    /// missing reading, and calculate physical usage from the raw free count.
+    static func capacity(total: UInt64, rawFree: UInt64?, importantFree: UInt64?)
+        -> (free: UInt64, used: UInt64, purgeable: UInt64?)? {
+        guard total > 0, rawFree != nil || importantFree != nil else { return nil }
+        let free = min(total, max(rawFree ?? 0, importantFree ?? 0))
+        let physicalFree = min(total, rawFree ?? free)
+        let purgeable = rawFree != nil && free > physicalFree ? free - physicalFree : nil
+        return (free, total - physicalFree, purgeable)
+    }
 
     /// Short user-facing label for a volume format. `type` is the mount table
     /// token (statfs f_fstypename / diskutil FilesystemType); `name` is the
@@ -124,7 +162,7 @@ enum DiskSupport {
 
     static func healthPercent(fromPercentageUsed used: UInt64?) -> Int? {
         guard let used else { return nil }
-        return max(0, min(100, 100 - Int(used)))
+        return max(0, min(100, 100 - Int(clamping: used)))
     }
 
     static func smartReading(status: String?, vendorKeys: [String: Any]?) -> DiskSMARTReading? {

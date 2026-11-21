@@ -4,7 +4,7 @@
 import AppKit
 import SwiftUI
 
-/// A brief percentage overlay for every brightness route. The disabled
+/// A brief percentage overlay for brightness and monitor speaker presses. The disabled
 /// feature owns no window, observer or timer.
 enum BrightnessOSD {
     private static var panel: NSPanel?
@@ -12,16 +12,25 @@ enum BrightnessOSD {
     private static var dismissWork: DispatchWorkItem?
     private static var generation = 0
 
-    static func show(displayID: CGDirectDisplayID, brightness: Double) {
+    /// Volume presses skip the island's brightness face, which is for brightness only.
+    static func show(displayID: CGDirectDisplayID, level: Double,
+                     kind: BrightnessOSDView.Kind = .brightness) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async {
-                show(displayID: displayID, brightness: brightness)
+                show(displayID: displayID, level: level, kind: kind)
             }
             return
         }
+        if kind == .brightness, NotchSupport.routes(.brightness), NotchService.shared.showBrightness(level) {
+            return
+        }
+        // A display mirroring another has no screen of its own; the overlay
+        // goes on the screen the mirror set shares, in hardware or software.
+        let sharedScreenID = CGDisplayPrimaryDisplay(displayID)
+        let mirroredID = CGDisplayMirrorsDisplay(displayID)
         guard let screen = NSScreen.screens.first(where: {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
-                .uint32Value == displayID
+            let number = ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            return number == displayID || number == sharedScreenID || number == mirroredID
         }) else { return }
 
         // One hosting controller for the panel's lifetime: a slider drag
@@ -30,10 +39,10 @@ enum BrightnessOSD {
         let panel = ensurePanel()
         let host: NSHostingController<BrightnessOSDView>
         if let existing = Self.host {
-            existing.rootView = BrightnessOSDView(brightness: brightness)
+            existing.rootView = BrightnessOSDView(level: level, kind: kind)
             host = existing
         } else {
-            host = NSHostingController(rootView: BrightnessOSDView(brightness: brightness))
+            host = NSHostingController(rootView: BrightnessOSDView(level: level, kind: kind))
             Self.host = host
             panel.contentViewController = host
         }
@@ -102,9 +111,9 @@ enum BrightnessOSD {
 
     private static func ensurePanel() -> NSPanel {
         if let panel { return panel }
-        let panel = NSPanel(contentRect: .zero,
-                            styleMask: [.borderless, .nonactivatingPanel],
-                            backing: .buffered, defer: false)
+        let panel = OverlayPanel(contentRect: .zero,
+                                 styleMask: [.borderless, .nonactivatingPanel],
+                                 backing: .buffered, defer: false)
         panel.level = .screenSaver
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -126,19 +135,34 @@ enum BrightnessOSD {
 /// Kept separate from the transient panel so the mandatory UI preview can
 /// host and inspect the exact shipped surface.
 struct BrightnessOSDView: View {
-    let brightness: Double
+    enum Kind: Equatable {
+        case brightness
+        case volume
+        case mutedVolume
+    }
+
+    let level: Double
+    var kind: Kind = .brightness
 
     private var percentage: Int {
-        BrightnessSupport.wholePercent(brightness)
+        BrightnessSupport.wholePercent(level)
     }
 
     private var filledSegments: Int {
-        BrightnessSupport.filledBrightnessSegments(brightness)
+        BrightnessSupport.filledBrightnessSegments(level)
+    }
+
+    private var symbol: String {
+        switch kind {
+        case .brightness: "sun.max.fill"
+        case .volume: "speaker.wave.2.fill"
+        case .mutedVolume: "speaker.slash.fill"
+        }
     }
 
     var body: some View {
         VStack(spacing: 11) {
-            Image(systemName: "sun.max.fill")
+            Image(systemName: symbol)
                 .font(.system(size: 39, weight: .regular))
                 .symbolRenderingMode(.monochrome)
                 .foregroundStyle(.white.opacity(0.82))

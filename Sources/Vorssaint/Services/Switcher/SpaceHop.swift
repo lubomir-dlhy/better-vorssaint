@@ -4,17 +4,14 @@
 import AppKit
 
 /// Takes a switcher or dock-preview selection to a window that lives on a
-/// Space the user is not looking at (issue #339). Accessibility cannot focus
-/// what it cannot see, so the hop runs in stages, each one verified against
-/// the window server and escalating only when the previous stage did not make
-/// the window's Space visible:
+/// Space the user is not looking at (issue #339). The hop runs in stages, each
+/// verified against the window server and escalating only when the previous
+/// stage did not make the window's Space visible:
 ///
-///  1. The window server is asked to front the exact window and the app is
-///     activated cooperatively. When the app has no window on any visible
-///     Space, macOS itself travels to one that has (standard system behavior),
-///     and older macOS also honors the Space of the fronted window. When the
-///     app does have a window here, that travel cannot happen, so this stage
-///     is not waited on at all.
+///  1. Accessibility is asked to raise the exact window, including windows an
+///     app omits from its published list, and the app is activated cooperatively.
+///     A successful raise or an app with no visible window gets time to travel
+///     natively. Otherwise the window server fronts the target before stepping.
 ///  2. If the Space still is not visible, the user's own "move a space"
 ///     shortcut is replayed (key and modifiers read from the system, honoring
 ///     remaps; skipped entirely when the user disabled it), one step at a
@@ -47,12 +44,25 @@ final class SpaceHop {
     static func beginIfNeeded(windowID: CGWindowID,
                               appPID: pid_t,
                               windowOwnerPID: pid_t,
+                              sourcePID: pid_t?,
                               app: NSRunningApplication) -> Bool {
-        guard let topology = SpaceWindowBridge.topology(),
-              SpaceWindowBridge.isParkedOnHiddenSpace(windowID, visibleSpaces: topology.visibleSpaces)
-        else { return false }
+        let topology = SpaceWindowBridge.topology()
+        // The topology decides whether the window can be reached at all, so
+        // the check only runs when there is a topology to check against.
+        let parkedOnHiddenSpace = topology.map {
+            SpaceWindowBridge.isParkedOnHiddenSpace(windowID, visibleSpaces: $0.visibleSpaces)
+        } ?? false
+        guard topology != nil, parkedOnHiddenSpace else { return false }
         cancelPending()
-        let hop = SpaceHop(windowID: windowID, appPID: appPID, windowOwnerPID: windowOwnerPID, app: app)
+        // The app's windows before anything moves: a window it opens during the
+        // hop is the user's, and the arrival pulses must leave it in front.
+        let focusState = SwitcherWindowFocusRetryState(
+            targetWindowID: windowID,
+            targetStartedMinimized: false,
+            targetWasObservedRestored: true,
+            knownWindowIDs: WindowActivator.focusSnapshot(ownerPID: windowOwnerPID))
+        let hop = SpaceHop(windowID: windowID, appPID: appPID, windowOwnerPID: windowOwnerPID,
+                           sourcePID: sourcePID, focusState: focusState, app: app)
         current = hop
         hop.start()
         return true
@@ -61,38 +71,55 @@ final class SpaceHop {
     static func cancelPending() {
         current?.restoreCursorIfNeeded()
         current?.cancelled = true
+        current?.writeGuard?.invalidate()
         current = nil
     }
 
     private let windowID: CGWindowID
     private let appPID: pid_t
     private let windowOwnerPID: pid_t
+    private let sourcePID: pid_t?
+    private let focusState: SwitcherWindowFocusRetryState
     private let app: NSRunningApplication
     private var cancelled = false
+    private var writeGuard: SwitcherActivationWriteGuard?
     private var arrowPressesLeft = SpaceHopSupport.maximumArrowSteps
     private var originalCursorLocation: CGPoint?
     private var warpedCursorLocation: CGPoint?
 
-    private init(windowID: CGWindowID, appPID: pid_t, windowOwnerPID: pid_t, app: NSRunningApplication) {
+    private init(windowID: CGWindowID, appPID: pid_t, windowOwnerPID: pid_t,
+                 sourcePID: pid_t?, focusState: SwitcherWindowFocusRetryState,
+                 app: NSRunningApplication) {
         self.windowID = windowID
         self.appPID = appPID
         self.windowOwnerPID = windowOwnerPID
+        self.sourcePID = sourcePID
+        self.focusState = focusState
         self.app = app
     }
 
     private func start() {
-        app.unhide()
-        SpaceWindowBridge.frontWindow(windowID, ownerPID: windowOwnerPID)
-        // Activating every window would drag the app's windows on the current
-        // Space forward too; when the app has one here, activate quietly and
-        // let the travel decide what comes up.
+        if app.isHidden { app.unhide() }
+        // Snapshot before raising: the target may already become visible while
+        // Accessibility is processing the request.
         let appIsAlreadyHere = appHasWindowOnVisibleSpace()
-        NSApp.yieldActivation(to: app)
-        if !app.activate(from: NSRunningApplication.current,
-                         options: appIsAlreadyHere ? [] : [.activateAllWindows]) {
-            app.activate(options: appIsAlreadyHere ? [] : [.activateAllWindows])
+        let directRaiseSucceeded = WindowActivator.raiseWindowOnHiddenSpace(windowID: windowID,
+                                                                             pid: windowOwnerPID)
+        let firstStage = SpaceHopSupport.firstStage(appHasWindowOnVisibleSpace: appIsAlreadyHere,
+                                                    directRaiseSucceeded: directRaiseSucceeded)
+        if firstStage == .moveASpace {
+            SpaceWindowBridge.frontWindow(windowID, ownerPID: windowOwnerPID)
         }
-        switch SpaceHopSupport.firstStage(appHasWindowOnVisibleSpace: appIsAlreadyHere) {
+        // frontWindow's synthetic press or activating all windows can divert
+        // native travel to a sibling. Hand off keyboard focus cooperatively
+        // even when the app already has a visible window.
+        let options: NSApplication.ActivationOptions =
+            appIsAlreadyHere || directRaiseSucceeded ? [] : [.activateAllWindows]
+        ActivationHandoff.yield(to: app)
+        if !app.activate(from: NSRunningApplication.current, options: options) {
+            app.activate(options: options)
+        }
+        switch firstStage {
         case .moveASpace:
             stepWithSpaceShortcut()
         case .waitForActivationTravel:
@@ -171,8 +198,13 @@ final class SpaceHop {
         }
         guard arrowPressesLeft > 0 else { finish(); return }
         arrowPressesLeft -= 1
-        guard let topology = SpaceWindowBridge.topology(),
-              let targetSpace = SpaceWindowBridge.spaces(of: windowID).first,
+        guard let topology = SpaceWindowBridge.topology() else {
+            // When system Spaces shortcuts are disabled, try direct Accessibility activation as fallback
+            focusOnArrival()
+            return
+        }
+        let targetSpaces = SpaceWindowBridge.spaces(of: windowID)
+        guard let targetSpace = targetSpaces.first,
               let steps = SpaceHopSupport.arrowSteps(orderedSpacesPerDisplay: topology.orderedSpacesPerDisplay,
                                                     visibleSpaces: topology.visibleSpaces,
                                                     target: targetSpace),
@@ -190,7 +222,7 @@ final class SpaceHop {
             let screenFrame = NSScreen.screens.first(where: {
                 (($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value) == displayID
             })?.frame
-            if let screenFrame, !screenFrame.contains(currentMouse) {
+            if let screenFrame, !NSMouseInRect(currentMouse, screenFrame, false) {
                 if originalCursorLocation == nil {
                     originalCursorLocation = CGEvent(source: nil)?.location
                 }
@@ -216,14 +248,31 @@ final class SpaceHop {
     }
 
     /// Accessibility starts describing the window shortly after its Space
-    /// becomes visible; a couple of pulses cover the settling time.
+    /// becomes visible; a couple of pulses cover the settling time. Only the
+    /// first one raises unconditionally; the others retry unless the target's
+    /// Space is visible and it is the focused window of the process that owns it, with that process in front.
     private func focusOnArrival() {
-        for delay in [0.15, 0.45, 0.9] {
+        let writeGuard = self.writeGuard ?? SwitcherActivationWriteGuard()
+        self.writeGuard = writeGuard
+        for (index, delay) in [0.15, 0.45, 0.9].enumerated() {
             schedule(after: delay) {
-                guard !self.cancelled, !self.app.isTerminated else { return }
+                guard !self.cancelled, writeGuard.isActive, !self.app.isTerminated else { return }
+                guard SpaceHopSupport.arrivalPulseShouldFocus(
+                    isFirstPulse: index == 0,
+                    targetSpaceIsVisible: self.windowSpaceIsVisible(),
+                    targetWindowID: self.windowID,
+                    windowOwnerPID: self.windowOwnerPID,
+                    frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                    focusedWindowID: WindowActivator.focusedWindowID(for: self.windowOwnerPID))
+                else {
+                    return
+                }
                 WindowActivator.focusAfterSpaceHop(windowID: self.windowID,
                                                    appPID: self.appPID,
-                                                   windowOwnerPID: self.windowOwnerPID)
+                                                   windowOwnerPID: self.windowOwnerPID,
+                                                   sourcePID: self.sourcePID,
+                                                   state: self.focusState,
+                                                   writeGuard: writeGuard)
             }
         }
         schedule(after: 1.0) { self.finish() }

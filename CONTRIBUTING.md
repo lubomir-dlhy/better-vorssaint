@@ -1,125 +1,118 @@
 # Contributing to Vorssaint
 
-Thanks for the interest. This project aims to stay small, native and readable.
-
-## License for contributions
-
-Unless it is stated otherwise, contributions to this repository are accepted
-under GPL-3.0-or-later.
+Vorssaint aims to stay small, native and readable. Contributions are accepted
+under GPL-3.0-or-later unless stated otherwise.
 
 ## Getting started
+
+You need macOS 14 or newer, Apple Silicon and the Xcode Command Line Tools.
+The project builds with `build.sh`, without an Xcode project or external package
+dependencies. `Package.swift` supports editor indexing; it does not assemble or
+sign the app bundle.
 
 ```sh
 git clone https://github.com/vorssaint/vorssaint-utils.git
 cd vorssaint-utils
-./build.sh                         # build and assemble the bundle
-./build/Vorssaint --selftest       # quick health check (SELFTEST OK)
-./build.sh --install               # install into /Applications and launch
+./build.sh --dev
+./build/VorssaintDeveloper --selftest
+./build.sh --test
 ```
 
-You need macOS 14 or newer, Apple Silicon and the Xcode Command Line Tools. The
-build is a plain `swiftc` invocation, see `build.sh`, with no Xcode project and
-no external dependencies, reproducible by design. `Package.swift` is there so
-SwiftPM aware editors can index the code.
+To install and launch the separate Developer app, use `./build.sh --dev --install`.
+It has its own preferences and permissions and does not replace the official app.
+A plain `./build.sh` builds the optimized variant used by CI; its health check is
+`./build/Vorssaint --selftest`.
 
-Hitting a build or permission snag while developing? See the
-[troubleshooting guide](docs/TROUBLESHOOTING.md).
+### Stable signing
 
-### Stable signing (optional)
+Developer and install builds automatically try to create a stable local signing
+identity when none is available. You can also run `./Tools/setup-signing.sh`.
+Keep that identity across rebuilds: ad-hoc signatures change with the binary and
+can invalidate macOS permission grants. Check the build output for signing
+failures. For stale grants, see [troubleshooting](docs/TROUBLESHOOTING.md#resetting-permissions).
 
-By default `build.sh` signs ad hoc, and that code hash changes on every build,
-so macOS asks again for Accessibility and Screen Recording after each rebuild.
-Run this once
+Official releases use Developer ID signing and notarization through the protected
+release workflow. Local signing does not produce an official release.
 
-```sh
-./Tools/setup-signing.sh
-```
+## Scope and implementation
 
-to create a free, self signed identity called `Vorssaint Utils Signing` in a
-dedicated keychain. `build.sh` then signs local builds with it and gives them a
-constant designated requirement, so granted permissions stick across rebuilds.
-It is a local convenience only and never shows up outside the keychain.
+Before a substantial feature, search existing issues and PRs and discuss the
+direction in an issue. Explain the user need, required permissions, dependencies
+and ongoing maintenance. Prefer existing macOS capabilities and repository code
+over a new subsystem. Keep each PR focused on one independently useful change.
 
-Official releases work differently. CI signs them with an Apple **Developer ID**,
-from the repo secrets `SIGNING_CERT_P12` and `SIGNING_CERT_PASSWORD`, then
-**notarizes** and staples them through `Tools/notarize.sh`, with secrets
-`NOTARY_API_KEY_P8`, `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID`, so downloads open
-with no Gatekeeper warning. `build.sh` prefers the Developer ID identity when it
-is present, with the hardened runtime and `Resources/Vorssaint.entitlements`,
-and falls back to the self signed identity, then to ad hoc.
+- App lifecycle lives in `Sources/Vorssaint/App`, shared catalogs and preferences
+  in `Core`, behavior in `Services`, views in `UI`, and diagnostics in `Support`.
+  Keep reusable decisions outside views where they can be tested.
+- Check other callers and the upgrade path when fixing shared behavior.
+- New features belong in the feature catalog, with availability and permission
+  checks on every entry point. Optional background work should stop when disabled.
+- User preferences must participate in settings backup. Machine-specific state
+  and private content need an explicit exclusion.
+- Update every locale in `AppLanguage.allCases`, including feature-specific
+  string catalogs. A new language also needs its locale registration, localized
+  permission prompts where applicable, and coverage tests.
+- New source files retain the project's SPDX license and copyright headers.
 
-## Project layout
+Sensor changes should include a dump from `./build/Vorssaint --sensors` and the
+Mac model. Selection logic lives in `TemperatureSensorSelector` and `SystemMonitor`.
 
-| Folder | Role |
-|---|---|
-| `Sources/Vorssaint/App` | App lifecycle and the menu bar status item |
-| `Sources/Vorssaint/Core` | Localization, permissions, UserDefaults keys |
-| `Sources/Vorssaint/Services` | All behavior, like energy, monitor, scroll and switcher |
-| `Sources/Vorssaint/UI` | SwiftUI views only, no business logic |
-| `Sources/Vorssaint/Support` | `--selftest` and `--sensors` diagnostics |
-| `Tools` | Icon generator and DMG packaging |
+## Validation
 
-A few conventions to keep in mind.
+Documentation-only changes need a diff and link check. For code changes, run the
+relevant tests; `./build.sh --list-tests` lists suites and
+`./build.sh --test-suite=NAME` selects one. Behavior tests should fail without the
+fix and preserve legitimate use, rather than pinning private implementation text.
 
-- **UI observes services, and services never import SwiftUI.** Keep that boundary.
-- Singletons are exposed as `Type.shared` and publish state with Combine through
-  `ObservableObject`, with no Observation macros, since the project builds with
-  the Command Line Tools.
-- Comments explain *why*, not *what*. Keep them rare and useful.
-- No new dependencies without talking it over first in an issue.
+The test executable compiles a selected set of sources, so passing tests does not
+prove the app builds. Build the app and run its selftest for runtime, UI or bundled
+resource changes. CI also checks the optimized build, selftest, tests and packaging.
+Builds should finish without warnings.
 
-## Strings and translations
-
-Every user facing string lives in `Core/Localization.swift` as a field of the
-`Strings` struct. Adding a field forces **every** supported language to provide
-it, and the compiler is the completeness check, so a translation can never
-silently fall out of sync.
-
-Vorssaint ships eight languages today, namely English, Português (Brasil),
-Español, Deutsch, Français, Italiano, 日本語 and 简体中文. The non base
-translations live in `Core/Localizations/`. To add a language, add a case to
-`AppLanguage` and a `static let` extension of `Strings` with every field
-translated.
-
-## Sensors on new chips
-
-Temperature mapping lives in `SystemMonitor.prepareSensorsIfNeeded()`. CPU keys
-look like `Tp…` and `Te…`, GPU is `Tg…`, and battery runs from `TB0T` to
-`TB2T`. If a new Apple Silicon generation renames the keys, run this
-
-```sh
-./build/Vorssaint --sensors
-```
-
-and open a PR with the dump and the adjusted prefixes.
-
-## Reporting bugs and requesting features
-
-You do not need to write code to help. Use the issue forms on the
-[new issue](https://github.com/vorssaint/vorssaint-utils/issues/new/choose) page.
-
-- **Bug report.** Include your Vorssaint version from Settings under About and
-  your macOS version, plus clear steps to reproduce. The
-  [troubleshooting guide](docs/TROUBLESHOOTING.md) explains what makes a report
-  useful.
-- **Feature request.** Describe the problem you are trying to solve rather than
-  only a specific solution.
-
-For general help and every support channel, see [support](SUPPORT.md).
+For behavior involving windows, permissions or hardware, describe what you actually
+verified and on which Mac and macOS version. Include display, Spaces or language
+details when relevant, and state what remains untested. Compilation and static
+inspection alone do not demonstrate an interaction on a real Mac.
 
 ## Pull requests
 
-1. One topic per PR, with a clear description of the behavior before and after.
-2. `./build.sh` must finish without warnings and `--selftest` must pass.
-3. New user facing text must land in **every** supported language, since the
-   build will not compile until it does.
-4. Match the style of the file you are editing.
+Explain the behavior before and after, the scope and validation. Use
+`type(scope): lowercase imperative phrase` for the title and reuse an existing
+scope where possible. Open unfinished work as a draft and name what is missing.
+The [template](.github/PULL_REQUEST_TEMPLATE.md) is a prompt, not a form.
+
+Leave version bumps and `CHANGELOG.md` to the maintainer. Describe the user-visible
+effect in the PR so it can become a release note with your credit.
+
+When an issue exists, include one reference per line:
+
+```text
+Refs #123
+Refs #456
+```
+
+Avoid `Closes` or `Fixes`: those close the issue at merge, before users receive
+the fix. The fix-status workflow tracks the reference, notifies the reporter when
+a stable release carries the fix, and can close the issue after two weeks without
+a response. If the PR addresses only part of an issue, say exactly which part.
+
+For agent-assisted work, see [contributing with an agent](docs/AI-CONTRIBUTIONS.md).
+Bug reports and feature requests use the [issue forms](https://github.com/vorssaint/vorssaint-utils/issues/new/choose).
+Report vulnerabilities through [private security reporting](SECURITY.md).
 
 ## Releases (maintainers)
 
-```sh
-git tag v2.1.0 && git push origin v2.1.0
-```
+Integrating into `main`, pushing a branch and opening a PR do not publish a release.
+Publication requires an explicit release decision, including beta or stable.
 
-The `release` workflow builds the app, packages the DMG and attaches it to a
-GitHub release automatically.
+Before sending a version tag, validate the final commit on `main`, confirm its
+verified signature, and match `Resources/Info.plist` and the release notes to the
+chosen version. Use a signed tag such as `vX.Y.Z-beta.N` or `vX.Y.Z`.
+Sending the tag starts [the release workflow](.github/workflows/release.yml).
+
+The protected `release-signing` environment holds the signing and notarization
+credentials. The workflow builds, signs and notarizes the app and DMG, then
+publishes an immutable release. Confirm publication succeeded; a pushed tag alone
+is not a published version. Beta releases remain prereleases and do not replace
+the latest stable release or its Homebrew cask. Do not move published tags or
+replace published artifacts.

@@ -25,6 +25,7 @@ final class RecorderComposer {
     struct Plan {
         let sourceSize: CGSize
         let canvasSize: CGSize
+        let isScaleOnly: Bool
         let cardRect: CGRect
         let frameRate: Int
         let positions: [CGPoint]
@@ -56,6 +57,17 @@ final class RecorderComposer {
         /// once like everything else, so a frame is a lookup.
         let texts: [RecorderTextOverlay]
         let textOpacity: [[Double]]
+        /// GIF captions keep the preview's font metrics and minimum font size,
+        /// then scale with the picture instead of being laid out again smaller.
+        let textCanvasSize: CGSize
+        /// Pictures laid over the recording, each already resized to the
+        /// pixels it is drawn at, with the same per-frame solidity.
+        let images: [RecorderImageOverlay]
+        let imageSprites: [CGImage?]
+        let imageOpacity: [[Double]]
+        /// Areas kept unreadable and, for each frame, whether each one is on.
+        let blurs: [RecorderBlurRegion]
+        let blurCovers: [[Bool]]
     }
 
     private let plan: Plan
@@ -82,6 +94,7 @@ final class RecorderComposer {
     func render(_ source: CIImage, at seconds: Double) -> CIImage {
         let index = frameIndex(for: seconds)
         var content = source.cropped(to: CGRect(origin: .zero, size: plan.sourceSize))
+        content = blurred(content, at: seconds)
 
         let pointerWasOnScreen = plan.pointerVisible.indices.contains(index)
             ? plan.pointerVisible[index] : true
@@ -102,8 +115,30 @@ final class RecorderComposer {
         } else if let plate = plan.plate {
             content = content.composited(over: plate)
         }
+        content = drawImages(on: content, index: index)
         content = drawTexts(on: content, index: index)
         return content.cropped(to: CGRect(origin: .zero, size: plan.canvasSize))
+    }
+
+    /// Pictures share the captions' place above the zoom, and go under them:
+    /// a mark of your own belongs behind what the recording is saying.
+    private func drawImages(on content: CIImage, index: Int) -> CIImage {
+        guard !plan.images.isEmpty else { return content }
+        var result = content
+        for (order, overlay) in plan.images.enumerated() {
+            guard plan.imageOpacity.indices.contains(order),
+                  plan.imageOpacity[order].indices.contains(index),
+                  plan.imageSprites.indices.contains(order),
+                  let sprite = plan.imageSprites[order] else { continue }
+            let opacity = plan.imageOpacity[order][index]
+            guard opacity > 0.01 else { continue }
+            let size = CGSize(width: sprite.width, height: sprite.height)
+            let origin = overlay.anchor.origin(of: size, in: plan.canvasSize)
+            result = faded(CIImage(cgImage: sprite), opacity: opacity)
+                .transformed(by: CGAffineTransform(translationX: origin.x, y: origin.y))
+                .composited(over: result)
+        }
+        return result
     }
 
     /// Text sits on top of everything, including the background and the zoom:
@@ -111,6 +146,8 @@ final class RecorderComposer {
     /// frame the moment the zoom moved.
     private func drawTexts(on content: CIImage, index: Int) -> CIImage {
         guard !plan.texts.isEmpty else { return content }
+        let scale = CGAffineTransform(scaleX: plan.canvasSize.width / plan.textCanvasSize.width,
+                                      y: plan.canvasSize.height / plan.textCanvasSize.height)
         var result = content
         for (order, overlay) in plan.texts.enumerated() {
             guard plan.textOpacity.indices.contains(order),
@@ -118,15 +155,54 @@ final class RecorderComposer {
             let opacity = plan.textOpacity[order][index]
             guard opacity > 0.01,
                   let image = RecorderTextRenderer.image(for: overlay,
-                                                         canvasHeight: plan.canvasSize.height)
+                                                         canvasHeight: plan.textCanvasSize.height)
             else { continue }
             let size = CGSize(width: image.width, height: image.height)
-            let origin = RecorderTextRenderer.origin(for: overlay,
-                                                     textSize: size,
-                                                     canvas: plan.canvasSize)
+            let origin = overlay.anchor.origin(of: size, in: plan.textCanvasSize)
             result = faded(CIImage(cgImage: image), opacity: opacity)
                 .transformed(by: CGAffineTransform(translationX: origin.x, y: origin.y))
+                .transformed(by: scale)
                 .composited(over: result)
+        }
+        return result
+    }
+
+    /// Blurs go into the picture before anything else is drawn on it, so the
+    /// zoom magnifies the blur along with what it hides and the pointer still
+    /// travels over it. A mosaic under a blur, rather than either alone: blocks
+    /// destroy the letters and the blur destroys the blocks.
+    private func blurred(_ content: CIImage, at seconds: Double) -> CIImage {
+        guard !plan.blurs.isEmpty else { return content }
+        // Retiming can hold a source frame between two plan samples. Rounding
+        // forward must not uncover that frame before its protected interval
+        // ends. Cover both neighboring samples, including either side of cuts.
+        // Exact plan times still use just their own sample.
+        let position = max(0, seconds) * Double(plan.frameRate)
+        let last = max(0, plan.positions.count - 1)
+        let lower = min(last, Int(position.rounded(.down)))
+        let upper = min(last, Int(position.rounded(.up)))
+        var result = content
+        for (order, region) in plan.blurs.enumerated() {
+            guard plan.blurCovers.indices.contains(order),
+                  (lower...upper).contains(where: {
+                      plan.blurCovers[order].indices.contains($0)
+                          && plan.blurCovers[order][$0]
+                  }) else { continue }
+            let rect = region.pixelRect(in: plan.sourceSize)
+            guard rect.width >= 1, rect.height >= 1 else { continue }
+            let block = RecorderSupport.blurBlockSize(for: rect.size, strength: region.strength)
+            // Clamped first so the blur never pulls transparent edges in and
+            // lets a sliver of the original show through the border.
+            let hidden = content.clampedToExtent()
+                .applyingFilter("CIPixellate", parameters: [
+                    kCIInputScaleKey: block,
+                    kCIInputCenterKey: CIVector(x: rect.minX, y: rect.minY),
+                ])
+                .applyingFilter("CIGaussianBlur", parameters: [
+                    kCIInputRadiusKey: block * 0.6,
+                ])
+                .cropped(to: rect)
+            result = hidden.composited(over: result)
         }
         return result
     }
@@ -255,31 +331,51 @@ final class RecorderComposer {
     /// The master is written at a variable rate on purpose, so a still screen
     /// costs nothing while recording; the steady rate is imposed here instead,
     /// in the single decode pass the export already needs.
+    ///
+    /// Nil when a recording that carries an edit cannot be composed. The plain
+    /// path below draws the recording untouched, which is only ever right when
+    /// there is nothing drawn on it: answering with it after a failure would
+    /// hand back a file missing the areas kept unreadable, and everything else
+    /// the person put on the picture.
     static func videoComposition(track: AVAssetTrack,
                                  asset: AVAsset,
                                  duration: CMTime,
                                  frameRate: Int,
                                  composer: RecorderComposer?,
                                  sourceSize: CGSize,
-                                 outputSize: CGSize) async -> AVMutableVideoComposition {
+                                 outputSize: CGSize,
+                                 playbackSpeed: Double = 1) async -> AVMutableVideoComposition? {
         if let composer {
-            // The handler may run concurrently; this composer only reads
-            // immutable state while rendering each frame.
-            nonisolated(unsafe) let threadSafeComposer = composer
-            let composition = try? await AVMutableVideoComposition.videoComposition(
-                with: asset) { request in
-                    let rendered = threadSafeComposer.render(
-                        request.sourceImage,
-                        at: CMTimeGetSeconds(request.compositionTime))
-                    request.finish(with: rendered, context: nil)
-                }
-            if let composition {
-                composition.frameDuration = CMTime(value: 1,
-                                                   timescale: CMTimeScale(max(1, frameRate)))
-                composition.renderSize = composer.canvasSize
-                composition.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
-                return composition
-            }
+            // Not AVFoundation's Core Image handler: with a moving pointer it
+            // compiled new GPU programs frame after frame and kept them for as
+            // long as the composition lived, which took a long export on an M1
+            // to gigabytes (#3578). The same frames drawn by a compositor of
+            // our own, through one context, reuse a handful.
+            let timeline = (try? await asset.load(.duration)) ?? duration
+            guard timeline.isValid, timeline > .zero else { return nil }
+            let naturalSize = (try? await track.load(.naturalSize)) ?? sourceSize
+            let preferredTransform = (try? await track.load(.preferredTransform)) ?? .identity
+            // Track transforms count down from the top; Core Image counts up
+            // from the bottom. Normalize the oriented pixels before the plan
+            // crops them or places privacy blurs in the displayed picture.
+            let flip = CGAffineTransform(scaleX: 1, y: -1)
+            var sourceTransform = flip.concatenating(preferredTransform).concatenating(flip)
+            let sourceBounds = CGRect(origin: .zero, size: naturalSize).applying(sourceTransform)
+            sourceTransform.tx -= sourceBounds.minX
+            sourceTransform.ty -= sourceBounds.minY
+            let composition = AVMutableVideoComposition()
+            composition.customVideoCompositorClass = RecorderVideoCompositor.self
+            composition.instructions = [RecorderCompositionInstruction(
+                timeRange: CMTimeRange(start: .zero, duration: timeline),
+                trackID: track.trackID,
+                sourceTransform: sourceTransform,
+                composer: composer,
+                timing: RecorderExportTiming(speed: playbackSpeed))]
+            composition.frameDuration = CMTime(value: 1,
+                                               timescale: CMTimeScale(max(1, frameRate)))
+            composition.renderSize = composer.canvasSize
+            composition.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
+            return composition
         }
         let naturalSize = (try? await track.load(.naturalSize)) ?? sourceSize
         let preferredTransform = (try? await track.load(.preferredTransform)) ?? .identity
@@ -316,5 +412,85 @@ final class RecorderComposer {
         instruction.layerInstructions = [layer]
         composition.instructions = [instruction]
         return composition
+    }
+}
+
+/// The whole timeline as one instruction, carrying what every frame is drawn
+/// with.
+private final class RecorderCompositionInstruction: NSObject, AVVideoCompositionInstructionProtocol,
+                                                    @unchecked Sendable {
+    let timeRange: CMTimeRange
+    let enablePostProcessing = false
+    /// Every frame is drawn anew, so none may stand in for its neighbour.
+    let containsTweening = true
+    let requiredSourceTrackIDs: [NSValue]?
+    let passthroughTrackID = kCMPersistentTrackID_Invalid
+    let trackID: CMPersistentTrackID
+    let sourceTransform: CGAffineTransform
+    /// Only read while rendering, from whichever thread asks for a frame.
+    let composer: RecorderComposer
+    let timing: RecorderExportTiming
+
+    init(timeRange: CMTimeRange, trackID: CMPersistentTrackID, sourceTransform: CGAffineTransform,
+         composer: RecorderComposer,
+         timing: RecorderExportTiming) {
+        self.timeRange = timeRange
+        self.trackID = trackID
+        self.sourceTransform = sourceTransform
+        self.composer = composer
+        self.timing = timing
+        requiredSourceTrackIDs = [NSNumber(value: trackID)]
+    }
+}
+
+/// Draws each frame through `RecorderComposer.render` with one context shared
+/// by every preview and export.
+private final class RecorderVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
+    private static let context = CIContext()
+
+    /// Frames as the decoder made them, so Core Image does the one colour
+    /// conversion.
+    let sourcePixelBufferAttributes: [String: any Sendable]? = [
+        kCVPixelBufferPixelFormatTypeKey as String: [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                                     kCVPixelFormatType_32BGRA],
+    ]
+    let requiredPixelBufferAttributesForRenderContext: [String: any Sendable] = [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+    ]
+
+    func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {}
+
+    func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+        guard let instruction = request.videoCompositionInstruction as? RecorderCompositionInstruction,
+              let output = request.renderContext.newPixelBuffer() else {
+            request.finish(with: NSError(domain: AVFoundationErrorDomain,
+                                         code: AVError.Code.unknown.rawValue))
+            return
+        }
+        // Audio can run a little past the last video frame. There the frame
+        // is drawn on nothing, as the Core Image handler drew it, rather than
+        // failing the whole export.
+        let source = request.sourceFrame(byTrackID: instruction.trackID)
+            .map { CIImage(cvPixelBuffer: $0).transformed(by: instruction.sourceTransform) }
+            ?? CIImage.empty()
+        // Plans are built on the edited, unscaled clock. Map back before
+        // looking up zooms, cursor shapes, captions and privacy blurs,
+        // including frames on either side of a cut.
+        let seconds = instruction.timing.sourceTime(
+            forOutputTime: CMTimeGetSeconds(request.compositionTime))
+        // Over black, as the Core Image handler drew it: a buffer from the
+        // pool still holds an earlier frame wherever this one draws nothing.
+        let frame = instruction.composer.render(source, at: seconds)
+            .composited(over: CIImage(color: .black)
+                .cropped(to: CGRect(origin: .zero, size: instruction.composer.canvasSize)))
+        // Handed on only once the GPU has drawn it.
+        do {
+            try Self.context.startTask(toRender: frame, to: CIRenderDestination(pixelBuffer: output))
+                .waitUntilCompleted()
+        } catch {
+            request.finish(with: error)
+            return
+        }
+        request.finish(withComposedVideoFrame: output)
     }
 }

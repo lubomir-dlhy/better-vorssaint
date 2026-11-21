@@ -81,6 +81,7 @@ private final class FanControlOwnership {
 }
 
 private final class FanControlController {
+    private let log = Logger(subsystem: FanControlIdentifiers.helperID, category: "FanControl")
     private let queue = DispatchQueue(label: "com.vorssaint.fan-control.helper")
     private let ownership = FanControlOwnership()
     private var hardware: FanControlHardware?
@@ -210,7 +211,7 @@ private final class FanControlController {
                 self.temperatureFailures = 0
                 self.lastHeartbeatUptime = ProcessInfo.processInfo.systemUptime
                 self.lastStopReason = nil
-                log.notice("Cooling session refreshed after wake")
+                self.log.notice("Cooling session refreshed after wake")
                 reply(FanControlIPC.encode(.success(self.currentSnapshot())))
             } catch {
                 reply(FanControlIPC.encode(self.wakeRefreshFailure(reason: .hardwareChanged)))
@@ -334,6 +335,7 @@ private final class FanControlController {
 
     private func updateActiveConfiguration(_ configuration: FanControlConfiguration,
                                            duration: TimeInterval?) -> FanControlResponse {
+        if hardware == nil { hardware = FanControlHardware() }
         guard let hardware,
               let request = try? hardware.coolingRequest(for: configuration) else {
             return .failure(.controlFailed, snapshot: currentSnapshot())
@@ -629,7 +631,7 @@ private func runSelfTest() -> Bool {
     return true
 }
 
-if CommandLine.arguments.contains("--selftest") {
+if ProcessInfo.processInfo.arguments.contains("--selftest") {
     exit(runSelfTest() ? EXIT_SUCCESS : EXIT_FAILURE)
 }
 

@@ -28,8 +28,10 @@ final class HotkeyManager: ObservableObject {
     }
 
     private func register() {
-        let shortcut = GlobalShortcut.saved(for: DefaultsKey.keepAwakeShortcut,
-                                            fallback: .keepAwakeDefault)
+        guard let shortcut = GlobalShortcutRole.keepAwake.assignedShortcut() else {
+            unregister()
+            return
+        }
         if hotKeyRef != nil, registeredShortcut == shortcut { return }
         unregister()
         if eventHandler == nil {
@@ -69,6 +71,7 @@ final class HotkeyManager: ObservableObject {
             hotKeyRef = ref
             registeredShortcut = shortcut
             registrationFailed = false
+            SystemShortcutTakeover.claim(DefaultsKey.keepAwakeShortcut, shortcut: shortcut)
         } else {
             hotKeyRef = nil
             registeredShortcut = nil
@@ -80,6 +83,7 @@ final class HotkeyManager: ObservableObject {
         if let ref = hotKeyRef {
             UnregisterEventHotKey(ref)
             hotKeyRef = nil
+            SystemShortcutTakeover.release(DefaultsKey.keepAwakeShortcut)
         }
         registeredShortcut = nil
         registrationFailed = false

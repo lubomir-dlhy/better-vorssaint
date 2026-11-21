@@ -16,12 +16,13 @@ enum FeaturePreset: String, CaseIterable, Identifiable {
     /// binding runs. Updates keep every existing availability choice, and an
     /// interrupted setup keeps the selection already applied on its purpose
     /// step.
-    static func prepareFirstRunAvailability(in defaults: UserDefaults = .standard) {
+    static func prepareFirstRunAvailability(in defaults: UserDefaults = .standard,
+                                            preserving configuredKeys: Set<String> = []) {
         guard !defaults.bool(forKey: DefaultsKey.hasOnboarded),
               defaults.integer(forKey: DefaultsKey.onboardingStep) == 0
         else { return }
         let selected = FeaturePreset.essential.features
-        for feature in AppFeature.allCases {
+        for feature in AppFeature.allCases where !configuredKeys.contains(feature.availabilityKey) {
             defaults.set(selected.contains(feature), forKey: feature.availabilityKey)
         }
     }
@@ -89,32 +90,70 @@ enum FeatureEnergyProfile: String {
 extension AppFeature {
     var energyProfile: FeatureEnergyProfile {
         switch self {
-        case .scrollInverter, .focusFollowsMouse, .smoothScroll, .windowMaximizer, .middleClick,
-             .mouseNavigation, .mouseButtonShortcuts, .dockPreview, .dockClick, .shelf:
+        case .scrollInverter, .scrollHorizontal, .scrollZoom, .focusFollowsMouse, .smoothScroll, .linearScroll, .scrollSpeed, .windowMaximizer, .middleClick,
+             .mouseNavigation, .mouseButtonShortcuts, .mouseClickDebounce,
+             .dockPreview, .dockClick, .shelf:
             return .mouse
-        case .switcher, .keyboardDebounce, .finderCutPaste, .finderRename, .superKey:
+        case .keyboardDebounce, .finderCutPaste, .finderRename, .quitWindowProtection, .musicBlock:
             return .keyboard
-        case .textSnippets, .autoQuit:
+        // The switcher's tap also takes clicks and scrolls, and the Super key
+        // stamps its modifiers on mouse presses from a second tap.
+        case .switcher, .superKey, .textSnippets, .autoQuit:
             return .inputs
         case .windowLayout:
-            return UserDefaults.standard.bool(forKey: DefaultsKey.windowGestureEnabled)
-                || UserDefaults.standard.bool(forKey: DefaultsKey.windowEdgeSnapEnabled)
-                ? .pointer : .idle
+            let edgeSnapRuns = UserDefaults.standard.bool(forKey: DefaultsKey.windowEdgeSnapEnabled)
+                && !WindowEdgeSnapZone.enabledZones(
+                    from: UserDefaults.standard.string(
+                        forKey: DefaultsKey.windowEdgeSnapDisabledZones)
+                ).isEmpty
+            let pointerTapRuns = UserDefaults.standard.bool(forKey: DefaultsKey.windowGestureEnabled)
+                || edgeSnapRuns
+            let modifierTapRuns = UserDefaults.standard.bool(forKey: DefaultsKey.windowDirectionalEnabled)
+                && UserDefaults.standard.string(forKey: DefaultsKey.windowDirectionalShortcut)
+                    .flatMap(WindowDirectionalTrigger.init(storageValue:))
+                    .map { if case .modifiers = $0 { return true }; return false } == true
+            if modifierTapRuns { return .inputs }
+            return pointerTapRuns ? .pointer : .idle
         case .radialMenu:
-            // With a side button configured the trigger is a mouse tap;
-            // shortcut-only costs nothing at rest.
-            return RadialMenuMouseTrigger.sanitized(
-                UserDefaults.standard.string(forKey: DefaultsKey.radialMenuMouseButton)) == .off
-                ? .idle : .mouse
+            // A side button or the trackpad tap on any wheel keeps an input
+            // tap running; shortcut-only costs nothing at rest.
+            return RadialMenuSupport.opensFromMouseOrTrackpad(
+                UserDefaults.standard.data(forKey: DefaultsKey.radialMenuProfiles))
+                ? .mouse : .idle
+        case .notchNotifications, .notchGestures, .notchTimer, .notchQueue, .notchDownloads: return .idle
+        // It reads only while something is being watched, and stops on its own.
+        case .notchWatch: return .idle
+        // A blink every few seconds and a visit every few minutes, both
+        // drawn by Core Animation, with one timer waiting for the next visit.
+        case .notchMascot: return .periodic
+        case .notchAccessories: return .periodic
+        // Log changes arrive as file events; a timer keeps countdowns and
+        // limits current while the section is on.
+        case .notch, .notchCalendar, .notchLyrics, .notchLiveEqualizer, .notchAgents: return .periodic
         case .clipboardHistory, .urlCleaner, .extraBrightness,
              .monitorCPU, .monitorGPU, .monitorMemory,
-             .monitorNetwork, .monitorDisk, .monitorPower:
+             .monitorNetwork, .monitorDisk, .monitorPower, .connectedDevices:
             return .periodic
-        case .pastePlain, .mixer, .soundOutputSwitcher, .micMute,
-             .musicBlock, .keepAwake, .brightness, .quickLauncher, .quickToggles, .colorPicker,
+        case .mixer:
+            return UserDefaults.standard.bool(forKey: DefaultsKey.preciseVolumeRollerEnabled)
+                ? .keyboard : .idle
+        case .brightness:
+            // Following the pointer, the overlay and a finer step answer the
+            // brightness keys from a tap. Like Accessibility, the island's own
+            // notices are counted under the island.
+            let defaults = UserDefaults.standard
+            return defaults.bool(forKey: DefaultsKey.brightnessKeysEnabled)
+                || defaults.bool(forKey: DefaultsKey.brightnessOSDEnabled)
+                || (defaults.bool(forKey: DefaultsKey.displayVolumeEnabled)
+                    && defaults.bool(forKey: DefaultsKey.displayVolumeKeysEnabled))
+                || BrightnessSupport.KeyStep.sanitized(
+                    defaults.string(forKey: DefaultsKey.brightnessKeyStep)) != .standard
+                ? .keyboard : .idle
+        case .mouseAcceleration, .spacesOrder, .pastePlain, .soundOutputSwitcher, .audioPriority, .micMute,
+             .bluetoothSleep, .keepAwake, .quickLauncher, .quickToggles, .quitApps, .colorPicker,
              .screenOCR, .cleaningMode, .mediaTools, .cleaner, .uninstaller, .homebrew, .screenshot,
-             .cameraPreview, .scratchpad, .commandBar, .screenRecorder, .fanControl,
-             .diskImageInstaller, .killProcess:
+             .cameraPreview, .scratchpad, .commandBar, .screenRecorder, .wallpaper, .fanControl,
+             .diskImageInstaller, .killProcess, .portManager:
             return .idle
         case .appUpdates:
             // The list is on demand; only a background schedule keeps a timer.

@@ -5,8 +5,8 @@ import AppKit
 import CoreGraphics
 
 /// Watches a selected region while the person scrolls it, then joins only
-/// overlaps that can be identified confidently. Event monitors and images
-/// belong to this capture and leave as soon as it ends.
+/// overlaps that can be identified confidently. Pixel polling also handles
+/// scrollbar drags and keyboard scrolling without global event permissions.
 enum ScreenshotScrollingCapture {
     final class FinishSignal: @unchecked Sendable {
         private let lock = NSLock()
@@ -33,39 +33,42 @@ enum ScreenshotScrollingCapture {
         case failed
     }
 
-    private final class ScrollActivity: @unchecked Sendable {
-        struct Snapshot {
-            let generation: Int
-            let lastEventAt: TimeInterval
-        }
+    protocol AutomaticScroller {
+        @MainActor func isCurrent() -> Bool
+        @MainActor func scroll() -> Bool
+    }
 
-        private let lock = NSLock()
-        private var generation = 0
-        private var lastEventAt: TimeInterval = 0
+    enum AutoScrollAction: Equatable { case wait, scroll, finish, partial }
 
-        func record() {
-            lock.lock()
-            generation += 1
-            lastEventAt = ProcessInfo.processInfo.systemUptime
-            lock.unlock()
-        }
+    /// The capture loop drives scrolling only after observing its previous
+    /// attempt. No independent timer can keep scrolling after cancellation.
+    struct AutoScrollState {
+        private var waitingSince: TimeInterval?
+        private var attemptedAt: TimeInterval?
+        private var heightBeforeAttempt = 0
+        private var attemptsWithoutProgress = 0
 
-        var snapshot: Snapshot {
-            lock.lock()
-            defer { lock.unlock() }
-            return Snapshot(generation: generation, lastEventAt: lastEventAt)
+        mutating func next(now: TimeInterval, height: Int, settled: Bool,
+                           unmatched: Bool = false) -> AutoScrollAction {
+            if waitingSince == nil { waitingSince = now }
+            if let attemptedAt {
+                let elapsed = now - attemptedAt
+                guard elapsed >= 0.55, settled || elapsed >= 1.5 else { return .wait }
+                // Another step could move the last good frame entirely out of view.
+                if unmatched { return .partial }
+                attemptsWithoutProgress = height > heightBeforeAttempt ? 0 : attemptsWithoutProgress + 1
+                if attemptsWithoutProgress >= 3 { return .finish }
+            } else if !settled, now - (waitingSince ?? now) < 1.5 {
+                return .wait
+            }
+            attemptedAt = now
+            heightBeforeAttempt = height
+            return .scroll
         }
     }
 
-    private struct EventMonitors: @unchecked Sendable {
-        let local: Any?
-        let global: Any?
-    }
-
-    private static let idlePollNanoseconds: UInt64 = 35_000_000
     private static let sampleInterval: TimeInterval = 0.09
     private static let settleInterval: TimeInterval = 0.22
-    private static let maximumSettleInterval: TimeInterval = 0.75
     private static let finishGraceInterval: TimeInterval = 0.85
 
     static func capture(region: RecorderSupport.Region,
@@ -73,37 +76,18 @@ enum ScreenshotScrollingCapture {
                         hideVorssaintWindows: Bool,
                         protectedWindowIDs: Set<CGWindowID>,
                         finishSignal: FinishSignal,
+                        autoScroll: AutomaticScroller? = nil,
                         onProgress: @escaping @MainActor (Int) -> Void) async -> Result {
-        let activity = ScrollActivity()
-        let monitors = await installMonitors(activity: activity)
-        let result = await captureWhileScrolling(
-            region: region,
-            includePointer: includePointer,
-            hideVorssaintWindows: hideVorssaintWindows,
-            protectedWindowIDs: protectedWindowIDs,
-            finishSignal: finishSignal,
-            activity: activity,
-            onProgress: onProgress)
-        await removeMonitors(monitors)
-        return result
-    }
-
-    private static func captureWhileScrolling(
-        region: RecorderSupport.Region,
-        includePointer: Bool,
-        hideVorssaintWindows: Bool,
-        protectedWindowIDs: Set<CGWindowID>,
-        finishSignal: FinishSignal,
-        activity: ScrollActivity,
-        onProgress: @escaping @MainActor (Int) -> Void
-    ) async -> Result {
         do {
-            let startingGeneration = activity.snapshot.generation
-            guard let first = await capturedRegion(region,
-                                                   includePointer: includePointer,
-                                                   hideVorssaintWindows: hideVorssaintWindows,
-                                                   protectedWindowIDs: protectedWindowIDs)
-            else { return .failed }
+            try Task.checkCancellation()
+            guard let source = await ScreenshotCaptureEngine.prepareDisplayRegion(
+                displayID: region.displayID, pixelRect: region.pixelRect,
+                includePointer: includePointer, hideVorssaintWindows: hideVorssaintWindows,
+                protectedWindowIDs: protectedWindowIDs),
+                  let firstFrame = await source.image(),
+                  await autoScroll?.isCurrent() != false,
+                  let first = contentFrame(firstFrame)
+            else { return Task.isCancelled ? .cancelled : .failed }
             try Task.checkCancellation()
             guard let firstSample = sample(first) else { return .failed }
 
@@ -117,24 +101,22 @@ enum ScreenshotScrollingCapture {
             var contentPixelColumns: Range<Int>?
             var fixedBottomPixels = 0
             var footerSlice: CGImage?
-            var lastSeenGeneration = startingGeneration
-            var lastMatchedGeneration = startingGeneration
+            var hasUnmatchedContent = false
+            var lastChangedAt = startedAt
             var lastCaptureAt = ProcessInfo.processInfo.systemUptime
             var scrollPending = false
             var finishRequestedAt: TimeInterval?
+            var automatic = AutoScrollState()
             await onProgress(totalHeight)
 
             while true {
                 try Task.checkCancellation()
 
                 let now = ProcessInfo.processInfo.systemUptime
-                let currentActivity = activity.snapshot
-                if currentActivity.generation != lastSeenGeneration {
-                    lastSeenGeneration = currentActivity.generation
-                    scrollPending = true
-                }
                 if finishSignal.isRequested, finishRequestedAt == nil {
                     finishRequestedAt = now
+                    // Take one final frame even if no wheel event was delivered.
+                    scrollPending = true
                 }
                 if let finishRequestedAt,
                    !scrollPending || now - finishRequestedAt >= finishGraceInterval {
@@ -142,8 +124,7 @@ enum ScreenshotScrollingCapture {
                         slices: slices,
                         footerSlice: footerSlice,
                         region: region,
-                        activityGeneration: currentActivity.generation,
-                        lastMatchedGeneration: lastMatchedGeneration)
+                        hasUnmatchedContent: hasUnmatchedContent)
                 }
                 if now - startedAt
                     >= ScreenshotSupport.scrollingCaptureMaximumDuration
@@ -154,11 +135,8 @@ enum ScreenshotScrollingCapture {
                                      result: .limited)
                 }
 
-                guard scrollPending else {
-                    try await Task.sleep(nanoseconds: idlePollNanoseconds)
-                    continue
-                }
-
+                // Observe pixels throughout the session. Wheel monitors miss
+                // scrollbar drags, keyboard scrolling and some other apps.
                 let sinceLastCapture = now - lastCaptureAt
                 if sinceLastCapture < sampleInterval {
                     try await Task.sleep(nanoseconds: UInt64(
@@ -166,14 +144,14 @@ enum ScreenshotScrollingCapture {
                     continue
                 }
 
-                let activityBeforeCapture = activity.snapshot
-                guard let current = await capturedRegion(
-                    region,
-                    includePointer: includePointer,
-                    hideVorssaintWindows: hideVorssaintWindows,
-                    protectedWindowIDs: protectedWindowIDs),
+                guard let frame = await source.image(),
+                      await autoScroll?.isCurrent() != false,
+                      let current = contentFrame(frame),
                       let currentSample = sample(current)
-                else { return .failed }
+                else {
+                    return completed(slices: slices, footerSlice: footerSlice,
+                                     region: region, result: .partial)
+                }
                 try Task.checkCancellation()
                 lastCaptureAt = ProcessInfo.processInfo.systemUptime
                 let frameIsStable = ScreenshotSupport.scrollingSamplesAreStable(
@@ -181,6 +159,7 @@ enum ScreenshotScrollingCapture {
                     currentSample,
                     contentColumns: contentSampleColumns)
                 lastObservedSample = currentSample
+                if !frameIsStable { lastChangedAt = lastCaptureAt }
                 let transition = ScreenshotSupport.scrollingTransition(
                     previous: previousSample,
                     current: currentSample,
@@ -188,8 +167,7 @@ enum ScreenshotScrollingCapture {
 
                 switch transition {
                 case .end:
-                    lastMatchedGeneration = max(lastMatchedGeneration,
-                                                activityBeforeCapture.generation)
+                    hasUnmatchedContent = false
 
                 case .advanced(let sampleOverlap, .forward, let matchedColumns):
                     let overlap = Int((CGFloat(sampleOverlap) / CGFloat(currentSample.height)
@@ -197,11 +175,10 @@ enum ScreenshotScrollingCapture {
                     guard overlap > 0, overlap < current.height else { return .failed }
                     let establishingContent = contentSampleColumns == nil
                     if establishingContent {
-                        guard let pixelColumns = ScreenshotSupport.scrollingPixelRange(
-                            sampleColumns: matchedColumns,
-                            sampleWidth: currentSample.width,
-                            imageWidth: current.width)
-                        else { return .failed }
+                        // Matching may use only the narrow text at one edge of
+                        // a Terminal. It is evidence of movement, not the bounds
+                        // of the selected image; keep every selected column.
+                        let pixelColumns = 0..<current.width
                         let fixedBottomRows = ScreenshotSupport.scrollingFixedBottomRows(
                             previous: previousSample,
                             current: currentSample,
@@ -284,30 +261,43 @@ enum ScreenshotScrollingCapture {
                     totalHeight = nextHeight
                     retainedPixels += stripPixels
                     previousSample = currentSample
-                    lastMatchedGeneration = max(lastMatchedGeneration,
-                                                activityBeforeCapture.generation)
+                    hasUnmatchedContent = false
                     await onProgress(totalHeight)
 
                 case .advanced(_, .backward, _):
                     // Scrolling back never duplicates pixels already kept. A
                     // later forward movement can continue from the furthest
                     // accepted frame without inventing a seam.
-                    lastMatchedGeneration = max(lastMatchedGeneration,
-                                                activityBeforeCapture.generation)
+                    hasUnmatchedContent = autoScroll != nil
 
                 case .unmatched:
-                    break
+                    hasUnmatchedContent = true
                 }
 
-                let activityAfterCapture = activity.snapshot
-                if activityAfterCapture.generation != lastSeenGeneration {
-                    lastSeenGeneration = activityAfterCapture.generation
-                    scrollPending = true
-                }
-                let quietFor = lastCaptureAt - activityAfterCapture.lastEventAt
-                if quietFor >= settleInterval,
-                   frameIsStable || quietFor >= maximumSettleInterval {
-                    scrollPending = false
+                scrollPending = !frameIsStable || lastCaptureAt - lastChangedAt < settleInterval
+                if let autoScroll, !finishSignal.isRequested {
+                    switch automatic.next(now: lastCaptureAt, height: totalHeight,
+                                          settled: !scrollPending, unmatched: hasUnmatchedContent) {
+                    case .wait:
+                        break
+                    case .finish:
+                        return completed(slices: slices, footerSlice: footerSlice,
+                                         region: region, result: .success)
+                    case .partial:
+                        return completed(slices: slices, footerSlice: footerSlice,
+                                         region: region, result: .partial)
+                    case .scroll:
+                        // Finish and Cancel come from the main thread. Check there
+                        // too, after the hop and immediately before posting.
+                        let canContinue = await MainActor.run {
+                            if Task.isCancelled || finishSignal.isRequested { return true }
+                            return autoScroll.scroll()
+                        }
+                        guard canContinue else {
+                            return completed(slices: slices, footerSlice: footerSlice,
+                                             region: region, result: .partial)
+                        }
+                    }
                 }
             }
         } catch is CancellationError {
@@ -320,15 +310,13 @@ enum ScreenshotScrollingCapture {
     private static func completedByUser(slices: [CGImage],
                                         footerSlice: CGImage?,
                                         region: RecorderSupport.Region,
-                                        activityGeneration: Int,
-                                        lastMatchedGeneration: Int) -> Result {
-        guard activityGeneration > lastMatchedGeneration else {
+                                        hasUnmatchedContent: Bool) -> Result {
+        guard hasUnmatchedContent else {
             return completed(slices: slices,
                              footerSlice: footerSlice,
                              region: region,
                              result: .success)
         }
-        guard slices.count > 1 else { return .failed }
         return completed(slices: slices,
                          footerSlice: footerSlice,
                          region: region,
@@ -362,46 +350,51 @@ enum ScreenshotScrollingCapture {
         }
     }
 
-    private static func capturedRegion(_ region: RecorderSupport.Region,
-                                       includePointer: Bool,
-                                       hideVorssaintWindows: Bool,
-                                       protectedWindowIDs: Set<CGWindowID>) async -> CGImage? {
-        await ScreenshotCaptureEngine.captureDisplayRegion(
-            displayID: region.displayID,
-            pixelRect: region.pixelRect,
-            includePointer: includePointer,
-            hideVorssaintWindows: hideVorssaintWindows,
-            protectedWindowIDs: protectedWindowIDs)
-    }
-
-    @MainActor
-    private static func installMonitors(activity: ScrollActivity) -> EventMonitors {
-        func record(_ event: NSEvent) {
-            guard abs(event.scrollingDeltaY) > 0.0001 else { return }
-            activity.record()
+    /// ScreenCaptureKit can pad a region with a transparent edge row. Keeping
+    /// that row in each appended strip produces a dark seam in image viewers.
+    /// Remove only fully transparent outer rows/columns before matching, so the
+    /// overlap and strip coordinates describe the same actual screen pixels.
+    private static func contentFrame(_ image: CGImage) -> CGImage? {
+        if [.none, .noneSkipFirst, .noneSkipLast].contains(image.alphaInfo) { return image }
+        let width = image.width, height = image.height
+        guard width > 0, height > 0 else { return nil }
+        var alpha = [UInt8](repeating: 0, count: width * height)
+        let drawn = alpha.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                                          bitsPerComponent: 8, bytesPerRow: width,
+                                          space: CGColorSpaceCreateDeviceGray(),
+                                          bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue)
+            else { return false }
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
         }
-
-        let local = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            record(event)
-            return event
+        guard drawn else { return nil }
+        var top = 0, bottom = height, left = 0, right = width
+        while top < bottom && alpha[(top * width)..<((top + 1) * width)].allSatisfy({ $0 == 0 }) {
+            top += 1
         }
-        let global = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { event in
-            record(event)
+        while bottom > top && alpha[((bottom - 1) * width)..<(bottom * width)].allSatisfy({ $0 == 0 }) {
+            bottom -= 1
         }
-        return EventMonitors(local: local, global: global)
-    }
-
-    @MainActor
-    private static func removeMonitors(_ monitors: EventMonitors) {
-        if let local = monitors.local { NSEvent.removeMonitor(local) }
-        if let global = monitors.global { NSEvent.removeMonitor(global) }
+        guard top < bottom else { return nil }
+        while left < right && (top..<bottom).allSatisfy({ alpha[$0 * width + left] == 0 }) {
+            left += 1
+        }
+        while right > left && (top..<bottom).allSatisfy({ alpha[$0 * width + right - 1] == 0 }) {
+            right -= 1
+        }
+        guard left < right else { return nil }
+        if top == 0 && bottom == height && left == 0 && right == width { return image }
+        return image.cropping(to: CGRect(x: left, y: top, width: right - left, height: bottom - top))
     }
 
     private static func sample(_ image: CGImage) -> ScreenshotSupport.ScrollingSample? {
-        // Width can be reduced safely, but vertical rows stay one-for-one with
-        // the source. Resizing both axes turns an integer scroll into a
-        // fractional row offset and destroys an otherwise exact overlap.
-        let width = min(32, image.width)
+        // Keep native vertical rows for exact offsets and enough horizontal
+        // detail to distinguish digits in a wide Terminal. A 32-column thumbnail
+        // can make different digits look identical; the matcher selects a few
+        // informative columns from this wider sample to bound its work.
+        let width = min(256, image.width)
         let height = image.height
         guard width > 0, height > 0 else { return nil }
         var pixels = [UInt8](repeating: 0, count: width * height)
