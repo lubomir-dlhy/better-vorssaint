@@ -25,6 +25,7 @@ enum FanControlHardwareContract {
 
     enum TemperatureSensorSelector {
         static let minimumChipTemperature = 10.0
+        static var modelIdentifier: String? { SMCClient.current.modelIdentifier }
         static func currentPlatform() -> CPUTemperaturePlatform { .generic }
         static func isCPUTemperatureKey(_ name: String, platform: CPUTemperaturePlatform) -> Bool {
             name.hasPrefix("TC")
@@ -37,6 +38,7 @@ enum FanControlHardwareContract {
     }
 
     final class State {
+        var modelIdentifier: String?
         var values: [String: Double] = ["FNum": 2]
         var bytes: [String: [UInt8]] = [:]
         var writes: [Write] = []
@@ -301,5 +303,55 @@ enum FanControlHardwareContract {
                      }
                         && invalidLevelState.writes.isEmpty,
                      "an invalid cooling level cannot begin a manual write")
+
+        let (sensing, sensingState) = fresh()
+        sensingState.modelIdentifier = "MacBookPro18,3"
+        sensingState.values["TC0P"] = 45
+        sensingState.values["Tg04"] = 0
+        sensingState.values["Tg05"] = 9.2
+        sensingState.values["Tg0C"] = 0
+        sensingState.values["Tg0D"] = 9.2
+        let sleeping = try? sensing.readOnlySnapshot()
+        suite.expect(sleeping?.gpuPoweredDown == true
+                        && sleeping?.temperatures?.contains { $0.source == .hottestGPU } == false
+                        && sleeping?.temperatures?.first { $0.source == .hottestSoC }?.celsius == 45,
+                     "a sleeping M1 Pro GPU remains distinct from measured GPU and SoC temperatures")
+        sensingState.readValue = { key, _, value in key == "Tg05" ? nil : value }
+        let failedReading = sensing.readTemperatures()
+        suite.expect(!failedReading.gpuPoweredDown
+                        && !failedReading.readings.contains { $0.source == .hottestGPU },
+                     "a GPU sensor that fails to answer still leaves the GPU source unavailable")
+        sensingState.readValue = nil
+        sensingState.values["Tg05"] = 52
+        let awake = try? sensing.snapshot(isCooling: true, endsAt: nil, stopReason: nil)
+        suite.expect(awake?.gpuPoweredDown == false
+                        && awake?.temperatures?.first { $0.source == .hottestGPU }?.celsius == 52,
+                     "an active session reports the new GPU measurement as soon as the GPU wakes")
+
+        let (alternateM1, alternateState) = fresh()
+        alternateState.modelIdentifier = "MacBookPro17,1"
+        alternateState.values["Tg1b"] = 0
+        alternateState.values["Tg4b"] = 0
+        let unavailable = alternateM1.readTemperatures()
+        let gpuCurve = FanControlCurve(sensor: .hottestGPU, points: FanControlConfiguration.defaultCurve.points)
+        suite.expect(!unavailable.gpuPoweredDown
+                        && FanControlPolicy.curveCoolingLevel(curves: [gpuCurve], temperatures: unavailable.readings,
+                                                             gpuPoweredDown: unavailable.gpuPoweredDown) == nil,
+                     "zero readings on the alternate M1 layout cannot start or sustain a GPU-only curve")
+
+        let (idleGPU, idleGPUState) = fresh()
+        idleGPUState.modelIdentifier = "MacBookPro18,3"
+        idleGPUState.values["TC0P"] = 45
+        idleGPUState.values["Tg04"] = 0
+        idleGPUState.values["Tg05"] = 9.2
+        idleGPUState.values["Tg0C"] = 0
+        idleGPUState.values["Tg0D"] = 9.2
+        let idleRequest = try? idleGPU.coolingRequest(for: .curve([gpuCurve]))
+        suite.expect(idleRequest??.level == gpuCurve.points[0].coolingLevel
+                        && idleRequest??.targets == [1_200, 1_200],
+                     "a sleeping M1 Pro GPU drives a GPU sensor curve to the fans' minimum")
+        idleGPUState.readValue = { key, _, value in key == "Tg05" ? nil : value }
+        suite.expect((try? idleGPU.coolingRequest(for: .curve([gpuCurve]))) == .some(nil),
+                     "a GPU key that fails to answer cannot produce a sensor-based GPU request")
     }
 }

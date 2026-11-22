@@ -6,7 +6,7 @@ import SwiftUI
 struct FanControlCurveEditor: View {
     let strings: FanControlFeatureStrings
     @Binding var curves: [FanControlCurve]
-    let temperatures: [FanControlTemperatureReading]
+    let snapshot: FanControlSnapshot
     let temperatureUnit: TemperatureUnit
     let disabled: Bool
 
@@ -152,14 +152,14 @@ struct FanControlCurveEditor: View {
 
     private var sourceOptions: [FanControlTemperatureSource] {
         let current = normalizedCurve.sensor
-        let detected = Set(temperatures.map(\.source))
+        let detected = snapshot.availableTemperatureSources
         return FanControlTemperatureSource.allCases.filter {
             $0 == current || detected.isEmpty || detected.contains($0)
         }
     }
 
     private func temperature(for source: FanControlTemperatureSource) -> Double? {
-        temperatures.first { $0.source == source }?.celsius
+        snapshot.temperatures?.first { $0.source == source }?.celsius
     }
 
     private func formattedTemperature(_ celsius: Double) -> String {

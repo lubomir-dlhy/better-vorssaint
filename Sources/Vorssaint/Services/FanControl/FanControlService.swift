@@ -169,11 +169,9 @@ final class FanControlService: ObservableObject {
         send({ proxy, reply in
             proxy.applyConfiguration(encodedConfiguration, withReply: reply)
         }) { response in
-            guard self.finishRequest(generation) else { return }
+            guard self.finishRequest(generation, response: response) else { return }
             self.isWorking = false
             guard let response else {
-                self.error = .helperUnavailable
-                self.invalidateTelemetry()
                 self.restoreAutomatic()
                 if resuming { self.resumeDidFail(.helperUnavailable) }
                 return
@@ -217,13 +215,9 @@ final class FanControlService: ObservableObject {
         isWorking = true
         startTimerIfNeeded()
         send { proxy, reply in proxy.restoreAutomatic(withReply: reply) } completion: { response in
-            guard self.finishRequest(generation) else { return }
+            guard self.finishRequest(generation, response: response) else { return }
             self.isWorking = false
-            guard let response else {
-                self.error = .helperUnavailable
-                self.invalidateTelemetry()
-                return
-            }
+            guard let response else { return }
             self.apply(response)
             if response.succeeded, !response.snapshot.isCooling {
                 if self.snapshot.fans.isEmpty, let retrySnapshot {
@@ -490,12 +484,7 @@ final class FanControlService: ObservableObject {
         guard !requestInFlight else { return }
         let generation = beginRequest()
         send { proxy, reply in proxy.status(withReply: reply) } completion: { response in
-            guard self.finishRequest(generation) else { return }
-            guard let response else {
-                self.error = .helperUnavailable
-                self.invalidateTelemetry()
-                return
-            }
+            guard self.finishRequest(generation, response: response), let response else { return }
             self.applyStatus(response)
             // Any decoded reply proves that the installed helper speaks this
             // protocol, even when the hardware itself is unsupported.
@@ -565,12 +554,7 @@ final class FanControlService: ObservableObject {
         guard snapshot.isCooling, !requestInFlight, !isWorking else { return }
         let generation = beginRequest()
         send { proxy, reply in proxy.heartbeat(withReply: reply) } completion: { response in
-            guard self.finishRequest(generation) else { return }
-            guard let response else {
-                self.error = .helperUnavailable
-                self.invalidateTelemetry()
-                return
-            }
+            guard self.finishRequest(generation, response: response), let response else { return }
             self.applyStatus(response)
         }
     }
@@ -589,11 +573,9 @@ final class FanControlService: ObservableObject {
         send { proxy, reply in
             proxy.refreshAfterWake(withReply: reply)
         } completion: { response in
-            guard self.finishRequest(generation) else { return }
+            guard self.finishRequest(generation, response: response) else { return }
             self.isWorking = false
             guard let response else {
-                self.error = .helperUnavailable
-                self.invalidateTelemetry()
                 self.restoreAutomatic()
                 return
             }
@@ -633,6 +615,7 @@ final class FanControlService: ObservableObject {
     private func invalidateTelemetry() {
         var unavailable = snapshot
         unavailable.temperatures = nil
+        unavailable.gpuPoweredDown = nil
         unavailable.sensors = nil
         snapshot = unavailable
     }
@@ -643,9 +626,13 @@ final class FanControlService: ObservableObject {
         return requestGeneration
     }
 
-    private func finishRequest(_ generation: Int) -> Bool {
+    private func finishRequest(_ generation: Int, response: FanControlResponse?) -> Bool {
         guard generation == requestGeneration else { return false }
         requestInFlight = false
+        if response == nil {
+            invalidateTelemetry()
+            error = .helperUnavailable
+        }
         return true
     }
 
@@ -737,7 +724,7 @@ final class FanControlService: ObservableObject {
         let generation = beginRequest()
         isWorking = true
         send { proxy, reply in proxy.restoreAutomatic(withReply: reply) } completion: { response in
-            guard self.finishRequest(generation) else { return }
+            guard self.finishRequest(generation, response: response) else { return }
             self.isWorking = false
             guard let response, response.succeeded, !response.snapshot.isCooling else { return }
             UserDefaults.standard.removeObject(forKey: DefaultsKey.fanControlRecoveryNeeded)
