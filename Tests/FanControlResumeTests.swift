@@ -165,12 +165,13 @@ enum FanControlResumeContract {
         legacy.isCooling = true
         service.statusResponse = .success(legacy)
         service.requestStatus()
-        suite.expect(service.snapshot == legacy && Service.helperAwaitsRegistration,
-                     "a status reply from the older helper during recovery leaves its registration pending")
+        suite.expect(service.snapshot == legacy && !Service.helperAwaitsRegistration
+                        && defaults.string(forKey: DefaultsKey.fanControlHelperVersion) == Service.helperVersion,
+                     "the fork keeps its helper registration, so any decoded status reply records the bundled version")
         service.statusResponse = .success(.empty)
         service.requestStatus()
-        suite.expect(!defaults.bool(forKey: DefaultsKey.fanControlRecoveryNeeded) && Service.helperAwaitsRegistration,
-                     "after recovery clears, the old helper still needs replacement")
+        suite.expect(!defaults.bool(forKey: DefaultsKey.fanControlRecoveryNeeded) && !Service.helperAwaitsRegistration,
+                     "after recovery clears, no registration swap is pending")
         defaults.removeObject(forKey: DefaultsKey.fanControlHelperVersion)
         service.requestStatus()
         suite.expect(defaults.string(forKey: DefaultsKey.fanControlHelperVersion) == Service.helperVersion,

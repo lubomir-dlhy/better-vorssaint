@@ -104,8 +104,8 @@ final class FanControlHardware {
                                   coolingLevel: nil,
                                   configuration: nil,
                                   temperatures: temperatures.readings,
-                                  gpuPoweredDown: temperatures.gpuPoweredDown,
-                                  sensors: readHardwareTemperatures())
+                                  sensors: readHardwareTemperatures(),
+                                  gpuPoweredDown: temperatures.gpuPoweredDown)
     }
 
     func coolingRequest(for configuration: FanControlConfiguration) throws
@@ -302,8 +302,8 @@ final class FanControlHardware {
                                   coolingLevel: coolingLevel,
                                   configuration: configuration,
                                   temperatures: temperatures.readings,
-                                  gpuPoweredDown: temperatures.gpuPoweredDown,
-                                  sensors: readHardwareTemperatures())
+                                  sensors: readHardwareTemperatures(),
+                                  gpuPoweredDown: temperatures.gpuPoweredDown)
     }
 
     func coolingIsIntact() -> Bool {

@@ -1179,14 +1179,12 @@ enum FeatureCatalogTests {
         suite.expect(!sleepingTemperatures.contains { $0.source == .hottestGPU }
                 && sleepingTemperatures.first { $0.source == .hottestSoC }?.celsius == 47.3,
                "a sleeping GPU contributes no measured GPU or SoC temperature")
-        let gpuCurve = FanControlCurve(sensor: .hottestGPU,
-                                       points: [.init(temperature: 25, coolingLevel: 35),
-                                                .init(temperature: 60, coolingLevel: 100)])
+        let gpuCurve = FanControlCurve(sensor: .hottestGPU, points: defaultCurve.points)
         suite.expect(FanControlPolicy.curveCoolingLevel(curves: [gpuCurve], temperatures: [],
-                                                      gpuPoweredDown: true) == 35
+                                                      gpuPoweredDown: true) == 0
                 && FanControlPolicy.curveCoolingLevel(curves: [gpuCurve], temperatures: []) == nil
                 && FanControlPolicy.curveCoolingLevel(curves: [gpuCurve],
-                                                      temperatures: [.init(source: .hottestGPU, celsius: 60)],
+                                                      temperatures: [.init(source: .hottestGPU, celsius: 70)],
                                                       gpuPoweredDown: true) == 100
                 && FanControlPolicy.curveCoolingLevel(curves: [defaultCurve], temperatures: [],
                                                       gpuPoweredDown: true) == nil,

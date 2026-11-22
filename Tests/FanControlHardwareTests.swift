@@ -347,11 +347,12 @@ enum FanControlHardwareContract {
         idleGPUState.values["Tg0C"] = 0
         idleGPUState.values["Tg0D"] = 9.2
         let idleRequest = try? idleGPU.coolingRequest(for: .curve([gpuCurve]))
-        suite.expect(idleRequest??.level == gpuCurve.points[0].coolingLevel
-                        && idleRequest??.targets == [1_200, 1_200],
+        suite.expect(idleRequest?.level == gpuCurve.points[0].coolingLevel
+                        && idleRequest?.targets == [1_200, 1_200],
                      "a sleeping M1 Pro GPU drives a GPU sensor curve to the fans' minimum")
         idleGPUState.readValue = { key, _, value in key == "Tg05" ? nil : value }
-        suite.expect((try? idleGPU.coolingRequest(for: .curve([gpuCurve]))) == .some(nil),
+        let missingGPURequest: FanControlCoolingRequest?? = { do { return .some(try idleGPU.coolingRequest(for: .curve([gpuCurve]))) } catch { return nil } }()
+        suite.expect(missingGPURequest == .some(nil),
                      "a GPU key that fails to answer cannot produce a sensor-based GPU request")
     }
 }
