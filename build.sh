@@ -452,6 +452,7 @@ if (( TEST )); then
         Sources/Vorssaint/Services/Homebrew/HomebrewSupport.swift
         Sources/Vorssaint/Services/Homebrew/HomebrewEnvironment.swift
         Sources/Vorssaint/Services/Homebrew/HomebrewManager.swift
+        Sources/Vorssaint/UI/MenuPanel/PanelHomebrewFilterPicker.swift
         Sources/Vorssaint/UI/HomebrewOperationStatusView.swift
         Sources/Vorssaint/Services/AppUpdates/AppUpdatesSupport.swift
         Sources/Vorssaint/Services/AppUpdates/AppUpdateFeedSupport.swift
@@ -510,8 +511,9 @@ if (( TEST )); then
         Sources/Vorssaint/Services/QuickTools/QuickToolsSupport.swift
         Sources/Vorssaint/Services/CommandBar/CommandBarSupport.swift
         Sources/Vorssaint/Services/CommandBar/CommandBarPreferences.swift
-        Sources/Vorssaint/Services/CommandBar/CommandBarMath.swift
-        Sources/Vorssaint/Services/CommandBar/CommandBarUnits.swift
+        Sources/Vorssaint/Services/CommandBar/CommandBarUnitCatalog.swift
+        Sources/Vorssaint/Services/CommandBar/CommandBarExpressions.swift
+        Sources/Vorssaint/Services/CommandBar/CommandBarCalculator.swift
         Sources/Vorssaint/Services/CommandBar/CommandBarColors.swift
         Sources/Vorssaint/Services/CommandBar/CommandBarEmoji.swift
         Sources/Vorssaint/Services/CommandBar/CommandBarLinks.swift
