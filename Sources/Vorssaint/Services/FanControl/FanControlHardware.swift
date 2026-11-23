@@ -75,17 +75,11 @@ final class FanControlHardware {
     }
 
     func readOnlySnapshot() throws -> FanControlSnapshot {
-        let fans = try discoverControlledFans()
-        let snapshot = FanControlSnapshot(fans: try readings(for: fans), isCooling: false,
-                                          endsAt: nil, stopReason: nil,
-                                          coolingLevel: nil,
-                                          configuration: nil,
-                                          temperatures: readTemperatures(),
-                                          sensors: readHardwareTemperatures())
+        let result = try snapshot(isCooling: false, endsAt: nil, stopReason: nil)
         if let forceTest = forceTestKey(), try byteValue(forceTest) != 0 {
             throw FanControlHardwareError.alreadyControlled
         }
-        return snapshot
+        return result
     }
 
     func telemetrySnapshot() throws -> FanControlSnapshot {
@@ -104,12 +98,14 @@ final class FanControlHardware {
                                     targetRPM: 0,
                                     isManuallyControlled: false)
         }
+        let temperatures = readTemperatures()
         return FanControlSnapshot(fans: readings, isCooling: false,
                                   endsAt: nil, stopReason: nil,
                                   coolingLevel: nil,
                                   configuration: nil,
-                                  temperatures: readTemperatures(),
-                                  sensors: readHardwareTemperatures())
+                                  temperatures: temperatures.readings,
+                                  sensors: readHardwareTemperatures(),
+                                  gpuPoweredDown: temperatures.gpuPoweredDown)
     }
 
     func coolingRequest(for configuration: FanControlConfiguration) throws
@@ -132,11 +128,17 @@ final class FanControlHardware {
                   let curve = configuration.curves.first,
                   let start = curve.points.first?.temperature,
                   let maximum = curve.points.last?.temperature else { return nil }
-            let temperatures = readTemperatures()
-            guard let reading = temperatures.first(where: { $0.source == curve.sensor }),
+            let sample = readTemperatures()
+            let gpuIdleReading = curve.sensor == .hottestGPU && sample.gpuPoweredDown
+                ? FanControlTemperatureReading(source: .hottestGPU,
+                                               celsius: TemperatureSensorSelector.minimumChipTemperature)
+                : nil
+            guard let reading = sample.readings.first(where: { $0.source == curve.sensor })
+                    ?? gpuIdleReading,
                   let level = FanControlPolicy.curveCoolingLevel(
                     curves: configuration.curves,
-                    temperatures: temperatures
+                    temperatures: sample.readings,
+                    gpuPoweredDown: sample.gpuPoweredDown
                   ) else { return nil }
             let previousTargets: [Double] = activeTargets.count == fans.count
                 ? activeTargets
@@ -291,14 +293,17 @@ final class FanControlHardware {
                   coolingLevel: Int? = nil,
                   configuration: FanControlConfiguration? = nil) throws -> FanControlSnapshot {
         let fans = try discoverControlledFans()
-        return FanControlSnapshot(fans: try readings(for: fans),
+        let fanReadings = try readings(for: fans)
+        let temperatures = readTemperatures()
+        return FanControlSnapshot(fans: fanReadings,
                                   isCooling: isCooling,
                                   endsAt: endsAt,
                                   stopReason: stopReason,
                                   coolingLevel: coolingLevel,
                                   configuration: configuration,
-                                  temperatures: readTemperatures(),
-                                  sensors: readHardwareTemperatures())
+                                  temperatures: temperatures.readings,
+                                  sensors: readHardwareTemperatures(),
+                                  gpuPoweredDown: temperatures.gpuPoweredDown)
     }
 
     func coolingIsIntact() -> Bool {
@@ -306,13 +311,14 @@ final class FanControlHardware {
         return verifyCooling(fans, targets: activeTargets)
     }
 
-    func readTemperatures() -> [FanControlTemperatureReading] {
+    func readTemperatures() -> FanControlTemperatureSample {
         let keys = discoverTemperatureKeys()
         let cpuReadings = temperatureReadings(keys.cpu)
+        let gpuReadings = keys.gpu.map { (key: $0.name, value: client.readValue($0)) }
         let hardwareReadings = rawHardwareTemperatures()
         var readings = FanControlPolicy.aggregatedTemperatures(
             cpuReadings: cpuReadings,
-            gpuReadings: temperatureReadings(keys.gpu).map(\.value),
+            gpuReadings: gpuReadings.compactMap(\.value),
             platform: temperaturePlatform
         )
         readings = FanControlPolicy.temperaturesIncludingDieSafety(
@@ -324,7 +330,10 @@ final class FanControlHardware {
         }
         readings.append(contentsOf:
             FanControlPolicy.rawControlTemperatureReadings(hardwareReadings))
-        return readings
+        let gpuPoweredDown = FanControlPolicy.gpuIsPoweredDown(
+            modelIdentifier: TemperatureSensorSelector.modelIdentifier, readings: gpuReadings
+        )
+        return FanControlTemperatureSample(readings: readings, gpuPoweredDown: gpuPoweredDown)
     }
 
     func readHardwareTemperatures() -> [FanControlSensorReading] {

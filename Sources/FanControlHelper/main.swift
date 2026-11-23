@@ -268,8 +268,6 @@ private final class FanControlController {
         }
         guard ownership.acquire() else { return .failure(.alreadyControlled) }
         if ownership.markerExists() {
-            isRecovering = true
-            startWatchdog()
             _ = performRestore(reason: .recovery)
             return .failure(.controlFailed, snapshot: currentSnapshot())
         }
@@ -360,6 +358,7 @@ private final class FanControlController {
 
     private func finishFailedStart(mayHaveChangedHardware: Bool) {
         if mayHaveChangedHardware, hardware?.restoreAutomatic() != true {
+            lastStopReason = .recovery
             isRecovering = true
             startWatchdog()
             return
@@ -380,25 +379,12 @@ private final class FanControlController {
             ownership.release()
             return true
         }
+        // Retrying the restore must preserve the reason the session ended.
+        if !isRecovering { lastStopReason = reason }
         if hardware == nil { hardware = FanControlHardware() }
-        guard hardware?.restoreAutomatic() == true,
-              ownership.removeMarker() else {
-            isRecovering = true
-            isCooling = false
-            owner = nil
-            coolingLevel = nil
-            activeConfiguration = nil
-            endsAt = nil
-            endsAtUptime = nil
-            verificationFailures = 0
-            temperatureFailures = 0
-            startWatchdog()
-            log.error("Automatic fan recovery will retry")
-            return false
-        }
-
+        let restored = hardware?.restoreAutomatic() == true && ownership.removeMarker()
+        isRecovering = !restored
         isCooling = false
-        isRecovering = false
         owner = nil
         coolingLevel = nil
         activeConfiguration = nil
@@ -406,10 +392,16 @@ private final class FanControlController {
         endsAtUptime = nil
         verificationFailures = 0
         temperatureFailures = 0
-        lastStopReason = reason
+        guard restored else {
+            startWatchdog()
+            log.error("Automatic fan recovery will retry: \(self.lastStopReason?.rawValue ?? "requested", privacy: .public)")
+            return false
+        }
         ownership.release()
         stopWatchdogIfIdle()
-        log.notice("Automatic fan control restored")
+        // The reason is the only trace of why a session ended; the app's card
+        // folds most of them into one generic message.
+        log.notice("Automatic fan control restored: \(self.lastStopReason?.rawValue ?? "requested", privacy: .public)")
         return true
     }
 
@@ -423,7 +415,6 @@ private final class FanControlController {
             scheduleExitIfIdle()
             return
         }
-        isRecovering = true
         hardware = FanControlHardware()
         if performRestore(reason: .recovery) {
             scheduleExitIfIdle()
@@ -514,8 +505,6 @@ private final class FanControlController {
 
         guard ownership.acquire() else { return .failure(.alreadyControlled) }
         if ownership.markerExists() {
-            isRecovering = true
-            startWatchdog()
             _ = performRestore(reason: .recovery)
             return isRecovering ? .failure(.controlFailed, snapshot: currentSnapshot())
                                 : .success(currentSnapshot())

@@ -72,6 +72,11 @@ struct FanControlSensorReading: Codable, Equatable, Identifiable, Sendable {
     var id: String { key }
 }
 
+struct FanControlTemperatureSample {
+    let readings: [FanControlTemperatureReading]
+    let gpuPoweredDown: Bool
+}
+
 struct FanControlCurvePoint: Codable, Equatable, Sendable {
     var temperature: Int
     var coolingLevel: Int
@@ -134,12 +139,19 @@ struct FanControlSnapshot: Codable, Equatable, Sendable {
     var configuration: FanControlConfiguration?
     var temperatures: [FanControlTemperatureReading]?
     var sensors: [FanControlSensorReading]? = nil
+    var gpuPoweredDown: Bool?
 
     static let empty = FanControlSnapshot(fans: [], isCooling: false,
                                           endsAt: nil, stopReason: nil,
                                           coolingLevel: nil,
                                           configuration: nil,
                                           temperatures: nil)
+
+    var availableTemperatureSources: Set<FanControlTemperatureSource> {
+        var sources = Set((temperatures ?? []).map(\.source))
+        if gpuPoweredDown == true { sources.insert(.hottestGPU) }
+        return sources
+    }
 }
 
 enum FanControlStopReason: String, Codable, Equatable, Sendable {
@@ -320,22 +332,28 @@ enum FanControlPolicy {
 
     static func curveCoolingLevel(curves: [FanControlCurve],
                                   temperatures: [FanControlTemperatureReading],
+                                  gpuPoweredDown: Bool = false,
                                   previousLevel: Int? = nil) -> Int? {
         // Macs Fan Control's sensor mode follows the selected sensor only.
         // Safety is handled independently by the helper watchdog and macOS
         // thermal pressure, never by silently substituting a different sensor.
-        configuredCurveCoolingLevel(curves: curves, temperatures: temperatures)
+        configuredCurveCoolingLevel(curves: curves, temperatures: temperatures,
+                                    gpuPoweredDown: gpuPoweredDown)
     }
 
     static func configuredCurveCoolingLevel(
         curves: [FanControlCurve],
-        temperatures: [FanControlTemperatureReading]
+        temperatures: [FanControlTemperatureReading],
+        gpuPoweredDown: Bool = false
     ) -> Int? {
         guard validCurves(curves) else { return nil }
         let values = Dictionary(temperatures.map { ($0.source, $0.celsius) },
                                 uniquingKeysWith: { _, newest in newest })
-        guard let curve = curves.first,
-              let temperature = values[curve.sensor], validTemperature(temperature) else {
+        guard let curve = curves.first else { return nil }
+        if curve.sensor == .hottestGPU, gpuPoweredDown, values[.hottestGPU] == nil {
+            return curve.points[0].coolingLevel
+        }
+        guard let temperature = values[curve.sensor], validTemperature(temperature) else {
             return nil
         }
         return interpolatedCoolingLevel(points: curve.points, temperature: temperature)
@@ -499,6 +517,21 @@ enum FanControlPolicy {
             }
         }
         return merged
+    }
+
+    /// On MacBookPro18,3 these four keys reported 0.0 and 9.2 °C (to one
+    /// decimal place) during GPU sleep. Other M1 layouts can return zeros
+    /// when no working GPU sensor is available.
+    static func gpuIsPoweredDown(modelIdentifier: String?,
+                                 readings: [(key: String, value: Double?)]) -> Bool {
+        guard modelIdentifier == "MacBookPro18,3", readings.count == 4 else { return false }
+        let answers = readings.compactMap { reading in
+            reading.value.map { (reading.key, $0) }
+        }
+        let values = Dictionary(answers, uniquingKeysWith: { _, latest in latest })
+        guard values["Tg04"] == 0, values["Tg0C"] == 0,
+              let tg05 = values["Tg05"], let tg0D = values["Tg0D"] else { return false }
+        return (tg05 * 10).rounded() == 92 && (tg0D * 10).rounded() == 92
     }
 
     static func aggregatedTemperatures(

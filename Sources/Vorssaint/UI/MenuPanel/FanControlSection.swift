@@ -127,7 +127,7 @@ struct FanControlCardContent: View {
                 case .curve:
                     FanControlCurveEditor(strings: strings,
                                           curves: $curves,
-                                          temperatures: snapshot.temperatures ?? [],
+                                          snapshot: snapshot,
                                           temperatureUnit: temperatureUnit,
                                           disabled: isWorking)
                     if !curveCanRun {
@@ -492,7 +492,7 @@ struct FanControlCardContent: View {
 
     private var curveCanRun: Bool {
         guard FanControlPolicy.validCurves(curves) else { return false }
-        let available = Set((snapshot.temperatures ?? []).map(\.source))
+        let available = snapshot.availableTemperatureSources
         return curves.allSatisfy { available.contains($0.sensor) }
     }
 }

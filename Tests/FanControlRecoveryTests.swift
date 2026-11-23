@@ -72,9 +72,29 @@ enum FanControlRecoveryContract {
         func cancel() { cancelled = true }
     }
 
-    struct Log {
-        func notice(_ message: String) {}
-        func error(_ message: String) {}
+    /// Accepts the helper's `Logger` interpolations, privacy included, and
+    /// keeps the rendered text so a test can read why a session ended.
+    struct LogMessage: ExpressibleByStringInterpolation {
+        enum Privacy { case `public`, `private` }
+        struct StringInterpolation: StringInterpolationProtocol {
+            var text = ""
+            init(literalCapacity: Int, interpolationCount: Int) {}
+            mutating func appendLiteral(_ literal: String) { text += literal }
+            mutating func appendInterpolation<Value>(_ value: Value, privacy: Privacy = .private) {
+                text += "\(value)"
+            }
+        }
+        let text: String
+        init(stringLiteral value: String) { text = value }
+        init(stringInterpolation: StringInterpolation) { text = stringInterpolation.text }
+    }
+
+    final class Log {
+        var notices: [String] = []
+        var errors: [String] = []
+        func info(_ message: LogMessage) {}
+        func notice(_ message: LogMessage) { notices.append(message.text) }
+        func error(_ message: LogMessage) { errors.append(message.text) }
     }
 
     class Fixture {
@@ -135,6 +155,8 @@ enum FanControlRecoveryContract {
                         && failed.lastStopReason == .hardwareChanged
                         && failedTimer?.cancelled == true && failed.timer == nil,
                      "repeated failed sensor writes restore firmware control at the verification limit")
+        suite.expect(failed.log.notices.last?.hasSuffix("hardwareChanged") == true,
+                     "the reason the session ended reaches the log")
         failed.hardware?.failUpdate = false
         failed.watchdogTick()
         suite.expect(failed.hardware?.updates == [50, 50, 50] && failed.hardware?.restores == 1,
@@ -170,7 +192,9 @@ enum FanControlRecoveryContract {
         suite.expect(recovering.isRecovering && !recovering.isCooling
                         && recovering.owner == nil && recovering.activeConfiguration == nil
                         && recovering.coolingLevel == nil && recovering.ownership.isHeld
-                        && recovering.ownership.marker && recovering.timer != nil,
+                        && recovering.ownership.marker && recovering.timer != nil
+                        && recovering.lastStopReason == .hardwareChanged
+                        && recovering.log.errors.last?.hasSuffix("hardwareChanged") == true,
                      "failed restoration retains the marker and watchdog but ends manual control ownership")
         recovering.hardware?.failUpdate = false
         recovering.watchdogTick()
@@ -181,8 +205,18 @@ enum FanControlRecoveryContract {
         suite.expect(recovering.hardware?.updates == [50, 50, 50] && recovering.hardware?.restores == 3
                         && recovering.hardware?.isManual == false && !recovering.isRecovering
                         && !recovering.ownership.marker && !recovering.ownership.isHeld
-                        && recovering.timer == nil && recovering.exitChecks == 1,
+                        && recovering.timer == nil && recovering.exitChecks == 1
+                        && recovering.lastStopReason == .hardwareChanged
+                        && recovering.log.notices.last?.hasSuffix("hardwareChanged") == true,
                      "successful automatic recovery releases ownership and stops retrying")
+
+        let requested = Controller()
+        requested.hardware?.restoreResults = [false, true]
+        _ = requested.performRestore(reason: nil)
+        requested.watchdogTick()
+        suite.expect(!requested.isRecovering && requested.lastStopReason == nil
+                        && requested.log.notices.last?.hasSuffix("requested") == true,
+                     "an explicit restore retains its requested reason across recovery")
 
         let markerFailure = Controller()
         markerFailure.hardware?.controlIntact = false
